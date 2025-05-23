@@ -59,6 +59,7 @@
 #include "clang/Config/config.h"
 #include "clang/Driver/Action.h"
 #include "clang/Driver/Compilation.h"
+#include "clang/Driver/ExplicitModuleBuildPlanner.h"
 #include "clang/Driver/InputInfo.h"
 #include "clang/Driver/Job.h"
 #include "clang/Driver/Options.h"
@@ -1457,6 +1458,17 @@ bool Driver::loadDefaultConfigFiles(llvm::cl::ExpansionContext &ExpCtx) {
   return false;
 }
 
+static bool argsSupportExplicitModuleDriverPhase(DerivedArgList &Args) {
+  return !Args.hasArgNoClaim(
+      options::OPT_fmodule_header, options::OPT_fmodule_header_EQ,
+      options::OPT_fmodule_output, options::OPT_fmodule_output_EQ);
+}
+
+static bool argsSuggestExplicitModuleDriverPhase(DerivedArgList &Args) {
+  return !Args.hasArgNoClaim(options::OPT_fprebuilt_module_path,
+                             options::OPT_fprebuilt_module_path);
+}
+
 Compilation *Driver::BuildCompilation(ArrayRef<const char *> ArgList) {
   llvm::PrettyStackTraceString CrashInfo("Compilation construction");
 
@@ -1814,9 +1826,26 @@ Compilation *Driver::BuildCompilation(ArrayRef<const char *> ArgList) {
   // Populate the tool chains for the offloading devices, if any.
   CreateOffloadingDeviceToolChains(*C, Inputs);
 
+  // TODO: Diagnostics should warn of incompatibilities
+  bool SupportsExplicitModuleBuildPlanner = false;
+  if (ModulesModeCXX20 && Inputs.size() > 1) {
+    Arg *FinalPhaseArg;
+    if (auto FinalPhase = getFinalPhase(*TranslatedArgs, &FinalPhaseArg);
+        (FinalPhase == phases::Link || FinalPhase == phases::Precompile) &&
+        argsSupportExplicitModuleDriverPhase(*TranslatedArgs)) {
+      SupportsExplicitModuleBuildPlanner = true;
+    }
+  }
+
   // Construct the list of abstract actions to perform for this compilation. On
   // MachO targets this uses the driver-driver and universal actions.
-  if (TC.getTriple().isOSBinFormatMachO())
+  if (SupportsExplicitModuleBuildPlanner &&
+      TranslatedArgs->hasFlag(
+          options::OPT_fmodules_driver, options::OPT_fno_modules_driver,
+          argsSuggestExplicitModuleDriverPhase(*TranslatedArgs))) {
+    ExplicitModuleBuildPlanner BuildPlanner{};
+    BuildPlanner.BuildActions(*C, Inputs);
+  } else if (TC.getTriple().isOSBinFormatMachO())
     BuildUniversalActions(*C, C->getDefaultToolChain(), Inputs);
   else
     BuildActions(*C, C->getArgs(), Inputs, C->getActions());
