@@ -3243,6 +3243,11 @@ def modules_reduced_bmi : Flag<["-"], "fmodules-reduced-bmi">,
 def experimental_modules_reduced_bmi : Flag<["-"], "fexperimental-modules-reduced-bmi">,
   Group<f_Group>, Visibility<[ClangOption, CC1Option]>, Alias<modules_reduced_bmi>;
 
+def fmodules_driver : Flag<["-"], "fmodules-driver">, Group<f_Group>,
+  HelpText<"Enable native support for standard C++ named modules from the Clang driver">;
+def fno_modules_driver : Flag<["-"], "fno-modules-driver">, Group<f_Group>,
+  HelpText<"Disable native support for standard C++ named modules from the Clang driver">;
+
 def fmodules_embed_all_files : Joined<["-"], "fmodules-embed-all-files">,
   Visibility<[ClangOption, CC1Option, CLOption]>,
   HelpText<"Embed the contents of all files read by this compilation into "
