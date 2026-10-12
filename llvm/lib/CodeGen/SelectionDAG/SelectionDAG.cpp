@@ -125,6 +125,23 @@ cl::opt<bool> DisableDAGKnownBits(
     "dag-disable-known-bits", cl::Hidden, cl::init(false),
     cl::desc("Disable SelectionDAG known bits, num sign bits and demanded bits "
              "analyses (always return unknown / no simplification)"));
+cl::opt<bool> DAGKnownBitsBoolOnly(
+    "dag-known-bits-bool-only", cl::Hidden, cl::init(false),
+    cl::desc("With -dag-disable-known-bits, still analyze boolean (setcc) "
+             "results, one level deep (the queried node only)"));
+}
+
+/// The boolean results -dag-known-bits-bool-only keeps analyzing.
+static bool isBooleanResult(unsigned Opcode) {
+  switch (Opcode) {
+  case ISD::SETCC:
+  case ISD::SETCCCARRY:
+  case ISD::STRICT_FSETCC:
+  case ISD::STRICT_FSETCCS:
+    return true;
+  default:
+    return false;
+  }
 } // namespace llvm
 
 static void NewSDValueDbgMsg(SDValue V, StringRef Msg, SelectionDAG *G) {
@@ -3359,7 +3376,8 @@ KnownBits SelectionDAG::computeKnownBits(SDValue Op, const APInt &DemandedElts,
 
   KnownBits Known(BitWidth);   // Don't know anything.
 
-  if (DisableDAGKnownBits)
+  if (DisableDAGKnownBits &&
+      !(DAGKnownBitsBoolOnly && Depth == 0 && isBooleanResult(Op.getOpcode())))
     return Known;
 
   if (auto OptAPInt = Op->bitcastToAPInt()) {
@@ -4964,7 +4982,8 @@ unsigned SelectionDAG::ComputeNumSignBits(SDValue Op, const APInt &DemandedElts,
   assert((!VT.isScalableVector() || NumElts == 1) &&
          "DemandedElts for scalable vectors must be 1 to represent all lanes");
 
-  if (DisableDAGKnownBits)
+  if (DisableDAGKnownBits &&
+      !(DAGKnownBitsBoolOnly && Depth == 0 && isBooleanResult(Op.getOpcode())))
     return 1;
 
   if (auto *C = dyn_cast<ConstantSDNode>(Op)) {

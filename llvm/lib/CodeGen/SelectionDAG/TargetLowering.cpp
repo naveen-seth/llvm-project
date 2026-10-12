@@ -43,7 +43,25 @@ using namespace llvm::SDPatternMatch;
 
 namespace llvm {
 extern cl::opt<bool> DisableDAGKnownBits;
+extern cl::opt<bool> DAGKnownBitsBoolOnly;
 } // namespace llvm
+
+/// With -dag-known-bits-bool-only, the node simplified at depth 0 may use the
+/// known bits of a boolean (setcc) operand, e.g. to drop `and (setcc), 1`.
+static bool hasBooleanOperand(SDValue Op) {
+  for (const SDValue &Operand : Op->op_values()) {
+    switch (Operand.getOpcode()) {
+    case ISD::SETCC:
+    case ISD::SETCCCARRY:
+    case ISD::STRICT_FSETCC:
+    case ISD::STRICT_FSETCCS:
+      return true;
+    default:
+      break;
+    }
+  }
+  return false;
+}
 
 /// NOTE: The TargetMachine owns TLOF.
 TargetLowering::TargetLowering(const TargetMachine &tm,
@@ -1301,7 +1319,8 @@ bool TargetLowering::SimplifyDemandedBits(
   // Don't know anything.
   Known = KnownBits(BitWidth);
 
-  if (DisableDAGKnownBits)
+  if (DisableDAGKnownBits &&
+      !(DAGKnownBitsBoolOnly && Depth == 0 && hasBooleanOperand(Op)))
     return false;
 
   EVT VT = Op.getValueType();

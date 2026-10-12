@@ -50,6 +50,17 @@ static cl::opt<bool> DisableGISelKnownBits(
     cl::desc("Disable GlobalISel known bits and num sign bits analyses "
              "(always return unknown)"));
 
+static cl::opt<bool> GISelKnownBitsBoolOnly(
+    "gisel-known-bits-bool-only", cl::Hidden, cl::init(false),
+    cl::desc("With -gisel-disable-known-bits, still analyze boolean "
+             "(G_ICMP/G_FCMP) results, one level deep (the queried "
+             "instruction only)"));
+
+/// The boolean results -gisel-known-bits-bool-only keeps analyzing.
+static bool isBooleanResult(unsigned Opcode) {
+  return Opcode == TargetOpcode::G_ICMP || Opcode == TargetOpcode::G_FCMP;
+}
+
 char llvm::GISelValueTrackingAnalysisLegacy::ID = 0;
 
 INITIALIZE_PASS(GISelValueTrackingAnalysisLegacy, DEBUG_TYPE,
@@ -284,7 +295,8 @@ void GISelValueTracking::computeKnownBitsImpl(Register R, KnownBits &Known,
   unsigned BitWidth = DstTy.getScalarSizeInBits();
   Known = KnownBits(BitWidth); // Don't know anything
 
-  if (DisableGISelKnownBits)
+  if (DisableGISelKnownBits &&
+      !(GISelKnownBitsBoolOnly && Depth == 0 && isBooleanResult(Opcode)))
     return;
 
   // Depth may get bigger than max depth if it gets passed to a different
@@ -2481,7 +2493,8 @@ unsigned GISelValueTracking::computeNumSignBits(Register R,
   MachineInstr &MI = *MRI.getVRegDef(R);
   unsigned Opcode = MI.getOpcode();
 
-  if (DisableGISelKnownBits)
+  if (DisableGISelKnownBits &&
+      !(GISelKnownBitsBoolOnly && Depth == 0 && isBooleanResult(Opcode)))
     return 1;
 
   if (Opcode == TargetOpcode::G_CONSTANT)
