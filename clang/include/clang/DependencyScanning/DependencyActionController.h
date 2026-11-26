@@ -48,6 +48,17 @@ public:
   virtual std::string lookupModuleOutput(const ModuleDeps &MD,
                                          ModuleOutputKind Kind) = 0;
 
+  /// For C++20 named modules whose object code is compiled from their BMI,
+  /// returns the path of the full BMI to emit as the main output of the module
+  /// build. If the module build should also emit a Reduced BMI, that is
+  /// emitted as a by-product to the path returned by \c lookupModuleOutput.
+  ///
+  /// Returns an empty string if the module is only built as a BMI for
+  /// importers. Must be thread-safe.
+  virtual std::string lookupNamedModuleCodeGenOutput(const ModuleDeps &MD) {
+    return {};
+  }
+
   /// Initializes the scan invocation.
   virtual void initializeScanInvocation(CompilerInvocation &ScanInvocation) {}
 

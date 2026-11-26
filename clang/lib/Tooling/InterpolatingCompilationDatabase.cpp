@@ -113,8 +113,6 @@ static types::ID foldType(types::ID Lang) {
   case types::TY_CXXHeader:
   case types::TY_CXXModule:
   case types::TY_PP_CXXModule:
-  case types::TY_CXXStdModule:
-  case types::TY_PP_CXXStdModule:
     return types::TY_CXX;
   case types::TY_ObjCXX:
   case types::TY_ObjCXXHeader:

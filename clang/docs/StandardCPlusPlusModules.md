@@ -593,32 +593,37 @@ digraph "Module Dependency Graph" {
 
 Clang's dependency scanning tooling needs to be invoked on a `-cc1` command line
 for each input. The Clang driver is therefore first run as it would be without
-`-fmodules-driver`, to create these command lines for all user inputs. By
-default, compilation jobs are also created for the C++ Standard library modules,
-because they too need to be scanned for dependencies if imported by any input
-specified on the command line.
+`-fmodules-driver`, to create these command lines for all user inputs.
 
 The Clang driver then:
 
-1. Scans all inputs for module dependencies.
-   C++ Standard library modules are scanned on demand, only if any user input
-   imports them.
+1. Determines which named modules are defined by the C++ module inputs, by
+   reading their module declarations, without running the preprocessor.
 
-2. Builds the dependency graph, where each node represents one compilation job.
-   This also generates `-cc1` command lines for any discovered Clang modules.
-   The compilation jobs created for C++ Standard library modules are removed if
-   they are not imported.
+2. Scans all inputs for module dependencies.
+   Inputs that define a named module are scanned by the module's name, all
+   other inputs are scanned as translation units.
+   Imported named modules are built implicitly during the scan, like Clang
+   modules, if they are defined by any input or listed in a module manifest.
+   Each module is built once and shared between all scans.
+   The C++ Standard library modules are listed in the Standard library module
+   manifest. Additional manifests can be passed with `-fmodules-manifest=`.
+
+3. Builds the dependency graph, where each node represents one compilation job.
+   This also creates the jobs building Clang modules and the named modules
+   listed in module manifests, using the `-cc1` command lines produced by the
+   scan. Named modules listed in module manifests are only built as BMIs, since
+   their object code is expected to be in a prebuilt library.
    This is the graph printed by `-Rmodules-driver`.
 
-3. Updates each job's command line to explicitly pass in its module
-   dependencies.
+4. Runs the jobs in topological order of the dependency graph. Jobs depending
+   on a failed job are not run. With `-fmodules-driver-jobs=<n>`, up to `<n>`
+   independent jobs are run in parallel.
 
-4. Runs the jobs in topological order of the dependency graph.
-
-`-fmodules-driver` currently requires Reduced BMIs, which are enabled by
-default. With Reduced BMIs, the BMI of a module unit is emitted as a by-product
-of the job compiling it to an object file, so the driver only needs to add
-`-fmodule-output` instead of creating a separate precompile job.
+Module units specified on the command line are always compiled in two phases:
+a precompile job emits the full BMI, and a second job compiles the full BMI
+into an object file. With Reduced BMIs, which are enabled by default, the
+Reduced BMI used by importers is emitted as a by-product of the precompile job.
 
 ##### Limitations
 
@@ -629,9 +634,8 @@ of the job compiling it to an object file, so the driver only needs to add
   `-stdlib=libc++` and `-fmodules` currently doesn't work correctly when
   importing `std`.
   See [discussion in PR #193312](https://github.com/llvm/llvm-project/pull/193312).
-- `-fno-modules-reduced-bmi` is not supported.
-- BMIs are always written as temporary files, and flags which influence the
-  output location of BMIs, such as `-fmodule-output=`, are ignored.
+- BMIs are written as temporary files, unless their location is specified with
+  `-fmodule-output=`.
 - Flags such as `-fsyntax-only` are not supported when compiling multiple
   input files. Using such flags would not be supported for the above examples.
 

@@ -22,7 +22,10 @@
 #include "clang/Driver/Tool.h"
 #include "clang/Driver/ToolChain.h"
 #include "clang/Driver/Types.h"
+#include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/StandaloneDiagnostic.h"
+#include "clang/Lex/DependencyDirectivesScanner.h"
+#include "clang/Lex/HeaderSearchOptions.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/DirectedGraph.h"
@@ -47,14 +50,6 @@ using namespace llvm::opt;
 using namespace clang;
 using namespace driver;
 using namespace modules;
-
-void driver::modules::diagnoseModulesDriverArgs(llvm::opt::DerivedArgList &DAL,
-                                                DiagnosticsEngine &Diags) {
-  if (!DAL.hasFlag(options::OPT_fmodules_reduced_bmi,
-                   options::OPT_fno_modules_reduced_bmi, true)) {
-    Diags.Report(diag::err_drv_modules_driver_requires_reduced_bmi);
-  }
-}
 
 namespace clang::driver::modules {
 static bool fromJSON(const llvm::json::Value &Params,
@@ -138,86 +133,8 @@ driver::modules::readStdModuleManifest(StringRef ManifestPath,
   return Manifest;
 }
 
-void driver::modules::buildStdModuleManifestInputs(
-    ArrayRef<StdModuleManifest::Module> ManifestEntries, Compilation &C,
-    InputList &Inputs) {
-  DerivedArgList &Args = C.getArgs();
-  const OptTable &Opts = C.getDriver().getOpts();
-  for (const auto &Entry : ManifestEntries) {
-    auto *InputArg =
-        makeInputArg(Args, Opts, Args.MakeArgString(Entry.SourcePath));
-    Inputs.emplace_back(types::TY_CXXStdModule, InputArg);
-  }
-}
-
-using ManifestEntryLookup =
-    llvm::DenseMap<StringRef, const StdModuleManifest::Module *>;
-
-/// Builds a mapping from a module's source path to its entry in the manifest.
-static ManifestEntryLookup
-buildManifestLookupMap(ArrayRef<StdModuleManifest::Module> ManifestEntries) {
-  ManifestEntryLookup ManifestEntryBySource;
-  for (auto &Entry : ManifestEntries) {
-    [[maybe_unused]] const bool Inserted =
-        ManifestEntryBySource.try_emplace(Entry.SourcePath, &Entry).second;
-    assert(Inserted &&
-           "Manifest defines multiple modules with the same source path.");
-  }
-  return ManifestEntryBySource;
-}
-
-/// Returns the manifest entry corresponding to \p Job, or \c nullptr if none
-/// exists.
-static const StdModuleManifest::Module *
-getManifestEntryForCommand(const Command &Job,
-                           const ManifestEntryLookup &ManifestEntryBySource) {
-  for (const auto &II : Job.getInputInfos()) {
-    if (const auto It = ManifestEntryBySource.find(II.getFilename());
-        It != ManifestEntryBySource.end())
-      return It->second;
-  }
-  return nullptr;
-}
-
-/// Adds all \p SystemIncludeDirs to the \p CC1Args of \p Job.
-static void
-addSystemIncludeDirsFromManifest(Compilation &C, Command &Job,
-                                 ArgStringList &CC1Args,
-                                 ArrayRef<std::string> SystemIncludeDirs) {
-  const ToolChain &TC = Job.getCreator().getToolChain();
-  const DerivedArgList &TCArgs =
-      C.getArgsForToolChain(&TC, Job.getSource().getOffloadingArch(),
-                            Job.getSource().getOffloadingDeviceKind());
-
-  for (const auto &IncludeDir : SystemIncludeDirs)
-    TC.addSystemInclude(TCArgs, CC1Args, IncludeDir);
-}
-
 static bool isCC1Job(const Command &Job) {
   return StringRef(Job.getCreator().getName()) == "clang";
-}
-
-/// Apply command-line modifications specific for inputs originating from the
-/// Standard library module manifest.
-static void applyArgsForStdModuleManifestInputs(
-    Compilation &C, const ManifestEntryLookup &ManifestEntryBySource,
-    MutableArrayRef<std::unique_ptr<Command>> Jobs) {
-  for (auto &Job : Jobs) {
-    if (!isCC1Job(*Job))
-      continue;
-
-    const auto *Entry = getManifestEntryForCommand(*Job, ManifestEntryBySource);
-    if (!Entry)
-      continue;
-
-    auto CC1Args = Job->getArguments();
-    if (Entry->IsStdlib)
-      CC1Args.push_back("-Wno-reserved-module-identifier");
-    if (Entry->LocalArgs)
-      addSystemIncludeDirsFromManifest(C, *Job, CC1Args,
-                                       Entry->LocalArgs->SystemIncludeDirs);
-    Job->replaceArguments(CC1Args);
-  }
 }
 
 /// Computes the -fmodule-cache-path for this compilation.
@@ -285,7 +202,6 @@ private:
               ScanningService)) {}
 
     std::unique_ptr<deps::DependencyScanningWorker> Worker;
-    llvm::DenseSet<deps::ModuleID> SeenModules;
   };
 
   std::mutex Lock;
@@ -295,13 +211,12 @@ private:
 };
 } // anonymous namespace
 
-// Creates a ThreadPool and a corresponding ScanningWorkerPool optimized for
-// the configuration of dependency scan inputs.
+// Creates a ThreadPool and a corresponding ScanningWorkerPool for scanning
+// \p NumScanInputs inputs.
 static std::pair<std::unique_ptr<llvm::ThreadPoolInterface>,
                  std::unique_ptr<ScanningWorkerPool>>
 createOptimalThreadAndWorkerPool(
-    size_t NumScanInputs, bool HasStdlibModuleInputs,
-    deps::DependencyScanningService &ScanningService) {
+    size_t NumScanInputs, deps::DependencyScanningService &ScanningService) {
   // TODO: Benchmark: Determine the optimal number of worker threads for a
   // given number of inputs. How many inputs are required for multi-threading
   // to be beneficial? How many inputs should each thread scan at least?
@@ -309,20 +224,15 @@ createOptimalThreadAndWorkerPool(
   std::unique_ptr<llvm::ThreadPoolInterface> ThreadPool;
   size_t WorkerCount;
 
-  if (NumScanInputs == 1 || (HasStdlibModuleInputs && NumScanInputs <= 2)) {
+  if (NumScanInputs <= 1) {
     auto S = llvm::optimal_concurrency(1);
     ThreadPool = std::make_unique<llvm::SingleThreadExecutor>(std::move(S));
     WorkerCount = 1;
   } else {
-    auto ThreadPoolStrategy = llvm::optimal_concurrency(
-        NumScanInputs - static_cast<size_t>(HasStdlibModuleInputs));
     ThreadPool = std::make_unique<llvm::DefaultThreadPool>(
-        std::move(ThreadPoolStrategy));
-    const size_t MaxConcurrency = ThreadPool->getMaxConcurrency();
-    const size_t MaxConcurrentlyScannedInputs =
-        NumScanInputs -
-        (HasStdlibModuleInputs && NumScanInputs < MaxConcurrency ? 1 : 0);
-    WorkerCount = std::min(MaxConcurrency, MaxConcurrentlyScannedInputs);
+        llvm::optimal_concurrency(NumScanInputs));
+    WorkerCount =
+        std::min<size_t>(ThreadPool->getMaxConcurrency(), NumScanInputs);
   }
 #else
   auto ThreadPool = std::make_unique<llvm::SingleThreadExecutor>();
@@ -340,43 +250,6 @@ static StringRef getTriple(const Command &Job) {
 using ModuleNameAndTriple = std::pair<StringRef, StringRef>;
 
 namespace {
-/// Helper to schedule on-demand dependency scans for modules originating from
-/// the Standard library module manifest.
-struct StdlibModuleScanScheduler {
-  StdlibModuleScanScheduler(const llvm::DenseMap<ModuleNameAndTriple, size_t>
-                                &StdlibModuleScanIndexByID)
-      : StdlibModuleScanIndexByID(StdlibModuleScanIndexByID) {
-    ScheduledScanInputs.reserve(StdlibModuleScanIndexByID.size());
-  }
-
-  /// Returns the indices of scan inputs corresponding to newly imported
-  /// Standard library modules.
-  ///
-  /// Thread-safe.
-  SmallVector<size_t, 2> getNewScanInputs(ArrayRef<std::string> NamedModuleDeps,
-                                          StringRef Triple) {
-    SmallVector<size_t, 2> NewScanInputs;
-    std::scoped_lock<std::mutex> Guard(Lock);
-    for (const auto &ModuleName : NamedModuleDeps) {
-      const auto It = StdlibModuleScanIndexByID.find({ModuleName, Triple});
-      if (It == StdlibModuleScanIndexByID.end())
-        continue;
-      const size_t ScanIndex = It->second;
-      const bool AlreadyScheduled =
-          !ScheduledScanInputs.insert(ScanIndex).second;
-      if (AlreadyScheduled)
-        continue;
-      NewScanInputs.push_back(ScanIndex);
-    }
-    return NewScanInputs;
-  }
-
-private:
-  const llvm::DenseMap<ModuleNameAndTriple, size_t> &StdlibModuleScanIndexByID;
-  llvm::SmallDenseSet<size_t> ScheduledScanInputs;
-  std::mutex Lock;
-};
-
 /// Collects diagnostics in a form that can be retained until after their
 /// associated SourceManager is destroyed.
 class StandaloneDiagCollector : public DiagnosticConsumer {
@@ -455,8 +328,7 @@ private:
 /// Report the diagnostics collected during each dependency scan.
 static void reportAllScanDiagnostics(
     SmallVectorImpl<SmallVector<StandaloneDiagnostic, 0>> &&AllScanDiags,
-    DiagnosticsEngine &Diags) {
-  StandaloneDiagReporter Reporter(Diags);
+    const StandaloneDiagReporter &Reporter) {
   for (auto &SingleScanDiags : AllScanDiags)
     Reporter.Report(SingleScanDiags);
 }
@@ -466,23 +338,59 @@ static std::string constructPCMPath(const deps::ModuleID &ID,
                                     StringRef OutputDir) {
   assert(!ID.ModuleName.empty() && !ID.ContextHash.empty() &&
          "Invalid ModuleID!");
+  // Sanitize the ':' included in partition names. It is illegal for filenames
+  // on Windows.
+  SmallString<32> SanitizedModuleName(ID.ModuleName);
+  llvm::replace(SanitizedModuleName, ':', '-');
   SmallString<256> ExplicitPCMPath(OutputDir);
   llvm::sys::path::append(ExplicitPCMPath, ID.ContextHash,
-                          ID.ModuleName + "-" + ID.ContextHash + ".pcm");
+                          SanitizedModuleName + "-" + ID.ContextHash + ".pcm");
   return std::string(ExplicitPCMPath);
 }
 
 namespace {
-/// A simple dependency action controller that only provides module lookup for
-/// Clang modules.
-class ModuleLookupController : public deps::DependencyActionController {
+/// Describes where a C++20 named module that inputs of this compilation may
+/// import is defined.
+struct NamedModuleProvider {
+  /// The interface source of the module, used to build the module implicitly
+  /// while scanning.
+  HeaderSearchOptions::NamedModuleSource Source;
+
+  /// If the module is defined by a command-line input, the path of the BMI
+  /// used by importers. Otherwise, the module is built on demand with a
+  /// dedicated BMI-only job, and its object code is expected to be in a
+  /// prebuilt library.
+  std::string OwnedBMIPath;
+
+  /// If the module is defined by a command-line input, the path of the full
+  /// BMI that the input's object file is compiled from. With Reduced BMIs,
+  /// \c OwnedBMIPath is emitted as a by-product of building this BMI.
+  std::string CodeGenBMIPath;
+
+  bool isOwnedByInput() const { return !OwnedBMIPath.empty(); }
+};
+
+/// The named module providers available to inputs, by module name.
+using NamedModuleProviderMap = std::map<std::string, NamedModuleProvider>;
+
+/// The dependency action controller used by the modules driver.
+///
+/// Provides the output paths of discovered modules and makes the named module
+/// providers known to the dependency scanner, so that imported named modules
+/// are built implicitly during the scan.
+class ModulesDriverActionController : public deps::DependencyActionController {
 public:
-  ModuleLookupController(StringRef OutputDir) : OutputDir(OutputDir) {}
+  ModulesDriverActionController(StringRef OutputDir,
+                                const NamedModuleProviderMap *Providers)
+      : OutputDir(OutputDir), Providers(Providers) {}
 
   std::string lookupModuleOutput(const deps::ModuleDeps &MD,
                                  deps::ModuleOutputKind Kind) override {
-    if (Kind == deps::ModuleOutputKind::ModuleFile)
+    if (Kind == deps::ModuleOutputKind::ModuleFile) {
+      if (const auto *Provider = getOwnedProvider(MD))
+        return Provider->OwnedBMIPath;
       return constructPCMPath(MD.ID, OutputDir);
+    }
 
     // Driver command lines that trigger lookups for unsupported
     // ModuleOutputKinds are not supported by the modules driver. Those
@@ -492,12 +400,45 @@ public:
         "call to lookupModuleOutput with unexpected ModuleOutputKind");
   }
 
+  std::string
+  lookupNamedModuleCodeGenOutput(const deps::ModuleDeps &MD) override {
+    if (const auto *Provider = getOwnedProvider(MD))
+      return Provider->CodeGenBMIPath;
+    return {};
+  }
+
+  void initializeScanInvocation(CompilerInvocation &ScanInvocation) override {
+    if (!Providers || Providers->empty())
+      return;
+
+    HeaderSearchOptions &HSOpts = ScanInvocation.getHeaderSearchOpts();
+    for (const auto &[Name, Provider] : *Providers)
+      HSOpts.NamedModuleSources[Name] = Provider.Source;
+    // Implicitly built named modules are stored in the module cache.
+    if (HSOpts.ModuleCachePath.empty())
+      HSOpts.ModuleCachePath = OutputDir.str();
+  }
+
   std::unique_ptr<DependencyActionController> clone() const override {
-    return std::make_unique<ModuleLookupController>(OutputDir);
+    return std::make_unique<ModulesDriverActionController>(OutputDir,
+                                                           Providers);
+  }
+
+  /// Returns the provider of \p MD if it is a named module defined by a
+  /// command-line input.
+  const NamedModuleProvider *
+  getOwnedProvider(const deps::ModuleDeps &MD) const {
+    if (!MD.IsCXXNamedModule || !Providers)
+      return nullptr;
+    const auto It = Providers->find(MD.ID.ModuleName);
+    if (It == Providers->end() || !It->second.isOwnedByInput())
+      return nullptr;
+    return &It->second;
   }
 
 private:
   StringRef OutputDir;
+  const NamedModuleProviderMap *Providers;
 };
 
 /// The full dependencies for a specific command-line input.
@@ -539,6 +480,30 @@ static InputDependencies makeInputDeps(deps::TranslationUnitDeps &&TUDeps) {
   return InputDeps;
 }
 
+/// Makes the input dependencies of a job building the named module
+/// \p ModuleName, from the by-name scan result \p TUDeps of that module.
+static std::optional<InputDependencies>
+makeInputDepsForOwnedModule(const deps::TranslationUnitDeps &TUDeps,
+                            StringRef ModuleName) {
+  const auto IsModule = [&](const deps::ModuleDeps &MD) {
+    return MD.IsCXXNamedModule && MD.ID.ModuleName == ModuleName;
+  };
+  const auto It = llvm::find_if(TUDeps.ModuleGraph, IsModule);
+  if (It == TUDeps.ModuleGraph.end())
+    return std::nullopt;
+
+  InputDependencies InputDeps;
+  InputDeps.ModuleName = ModuleName.str();
+  InputDeps.ClangModuleDeps = It->ClangModuleDeps;
+  for (const deps::ModuleID &Dep : It->ClangModuleDeps)
+    if (llvm::any_of(TUDeps.ModuleGraph, [&](const deps::ModuleDeps &MD) {
+          return MD.ID == Dep && MD.IsCXXNamedModule;
+        }))
+      InputDeps.NamedModuleDeps.push_back(Dep.ModuleName);
+  InputDeps.BuildArgs = It->getBuildArguments();
+  return InputDeps;
+}
+
 /// Constructs the full command line, including the executable, for \p Job.
 static SmallVector<std::string, 0> buildCommandLine(const Command &Job) {
   const auto &JobArgs = Job.getArguments();
@@ -550,191 +515,132 @@ static SmallVector<std::string, 0> buildCommandLine(const Command &Job) {
   return CommandLine;
 }
 
-/// Performs a dependency scan for a single job.
+namespace {
+/// A dependency scan of a job.
+struct ScanRequest {
+  const Command *Job;
+
+  /// If set, the job builds this named module, which is scanned by name
+  /// instead of scanning the job as a translation unit.
+  std::optional<std::string> ModuleName;
+};
+
+/// Collects the dependencies of a single by-name query.
+class ByNameDependencyConsumer : public deps::FullDependencyConsumer {
+public:
+  using FullDependencyConsumer::FullDependencyConsumer;
+
+  void finishQuery(StringRef ModuleName, bool Success) override {
+    Succeeded = Success;
+  }
+
+  bool Succeeded = false;
+};
+} // anonymous namespace
+
+/// Performs a dependency scan for a single request.
 ///
 /// \returns a pair containing TranslationUnitDeps on success, or std::nullopt
-/// on failure, along with any diagnostics produced.
+/// on failure, along with any diagnostics produced. For by-name scans, the
+/// TranslationUnitDeps contain only the module graph.
 static std::pair<std::optional<deps::TranslationUnitDeps>,
                  SmallVector<StandaloneDiagnostic, 0>>
-scanDependenciesForJob(const Command &Job, ScanningWorkerPool &WorkerPool,
+scanDependenciesForJob(const ScanRequest &Request,
+                       ScanningWorkerPool &WorkerPool,
                        StringRef WorkingDirectory,
-                       ModuleLookupController &LookupController) {
+                       deps::DependencyActionController &Controller) {
   StandaloneDiagCollector DiagConsumer;
   std::optional<deps::TranslationUnitDeps> MaybeTUDeps;
 
   {
-    const auto CC1CommandLine = buildCommandLine(Job);
+    auto CC1CommandLine = buildCommandLine(*Request.Job);
     auto WorkerBundleHandle = WorkerPool.scopedAcquire();
-    deps::FullDependencyConsumer DepConsumer(WorkerBundleHandle->SeenModules);
+    llvm::DenseSet<deps::ModuleID> AlreadySeen;
 
-    if (WorkerBundleHandle->Worker->computeDependencies(
-            WorkingDirectory, {CC1CommandLine}, DepConsumer, LookupController,
-            DiagConsumer))
-      MaybeTUDeps = DepConsumer.takeTranslationUnitDeps();
+    if (!Request.ModuleName) {
+      deps::FullDependencyConsumer DepConsumer(AlreadySeen);
+      if (WorkerBundleHandle->Worker->computeDependencies(
+              WorkingDirectory, {CC1CommandLine}, DepConsumer, Controller,
+              DiagConsumer))
+        MaybeTUDeps = DepConsumer.takeTranslationUnitDeps();
+    } else {
+      // Use the job's own command line, without its input, as the context to
+      // build the module in.
+      StringRef Input = Request.Job->getInputInfos().front().getFilename();
+      if (auto It = llvm::find(llvm::reverse(CC1CommandLine), Input);
+          It != CC1CommandLine.rend())
+        CC1CommandLine.erase(std::next(It).base());
+      auto [OverlayFS, ByNameCommandLine] =
+          deps::initVFSForByNameScanning(CC1CommandLine);
+
+      ByNameDependencyConsumer DepConsumer(AlreadySeen);
+      bool Queried = false;
+      auto GetNextName = [&]() -> std::optional<std::string> {
+        if (std::exchange(Queried, true))
+          return std::nullopt;
+        return *Request.ModuleName;
+      };
+      if (WorkerBundleHandle->Worker->computeDependenciesByName(
+              WorkingDirectory, ByNameCommandLine, std::move(OverlayFS),
+              DiagConsumer, Controller, GetNextName, DepConsumer) &&
+          DepConsumer.Succeeded)
+        MaybeTUDeps = DepConsumer.takeTranslationUnitDeps();
+    }
   }
 
   return {std::move(MaybeTUDeps), DiagConsumer.takeDiagnostics()};
 }
 
-namespace {
-struct DependencyScanResult {
-  /// Indices of jobs that were successfully scanned.
-  SmallVector<size_t> ScannedJobIndices;
-
-  /// Input dependencies for scanned jobs. Parallel to \c ScannedJobIndices.
-  SmallVector<InputDependencies, 0> InputDepsForScannedJobs;
-
-  /// Module dependency graphs for scanned jobs. Parallel to \c
-  /// ScannedJobIndices.
-  SmallVector<deps::ModuleDepsGraph, 0> ModuleDepGraphsForScannedJobs;
-
-  /// Indices of Standard library module jobs not discovered as dependencies.
-  SmallVector<size_t> UnusedStdlibModuleJobIndices;
-
-  /// Indices of jobs that could not be scanned (e.g. image jobs, ...).
-  SmallVector<size_t> NonScannableJobIndices;
-};
-} // anonymous namespace
-
-/// Scans the compilations job list \p Jobs for module dependencies.
+/// Performs the scans \p Requests, in parallel.
 ///
-/// Standard library module jobs are scanned on demand if imported by any
-/// user-provided input.
+/// \p GetController returns the action controller to use for a given job.
 ///
-/// \returns DependencyScanResult on success, or std::nullopt on failure, with
-/// diagnostics reported via \p Diags in both cases.
-static std::optional<DependencyScanResult> scanDependencies(
-    ArrayRef<std::unique_ptr<Command>> Jobs,
-    llvm::DenseMap<StringRef, const StdModuleManifest::Module *> ManifestLookup,
-    StringRef ModuleCachePath, StringRef WorkingDirectory,
-    StringRef DepScanLogPath, DiagnosticsEngine &Diags) {
+/// \returns the scan results in the order of \p Requests, or std::nullopt
+/// on failure, with diagnostics reported via \p DiagReporter in both cases.
+static std::optional<SmallVector<deps::TranslationUnitDeps, 0>>
+scanJobs(ArrayRef<ScanRequest> Requests,
+         deps::DependencyScanningService &ScanningService,
+         llvm::function_ref<deps::DependencyActionController &(const Command &)>
+             GetController,
+         StringRef WorkingDirectory,
+         const StandaloneDiagReporter &DiagReporter) {
   llvm::PrettyStackTraceString CrashInfo("Performing module dependency scan.");
 
-  // Classify the jobs based on scan eligibility.
-  SmallVector<size_t> ScannableJobIndices;
-  SmallVector<size_t> NonScannableJobIndices;
-  for (const auto &&[Index, Job] : llvm::enumerate(Jobs)) {
-    if (isDependencyScannableJob(*Job))
-      ScannableJobIndices.push_back(Index);
-    else
-      NonScannableJobIndices.push_back(Index);
-  }
-
-  // Classify scannable jobs by origin. User-provided inputs will be scanned
-  // immediately, while Standard library modules are indexed for on-demand
-  // scanning when discovered as dependencies.
-  SmallVector<size_t> UserInputScanIndices;
-  llvm::DenseMap<ModuleNameAndTriple, size_t> StdlibModuleScanIndexByID;
-  for (const auto &&[ScanIndex, JobIndex] :
-       llvm::enumerate(ScannableJobIndices)) {
-    const Command &ScanJob = *Jobs[JobIndex];
-    if (const auto *Entry =
-            getManifestEntryForCommand(ScanJob, ManifestLookup)) {
-      ModuleNameAndTriple ID{Entry->LogicalName, getTriple(ScanJob)};
-      [[maybe_unused]] const bool Inserted =
-          StdlibModuleScanIndexByID.try_emplace(ID, ScanIndex).second;
-      assert(Inserted &&
-             "Multiple jobs build the same module for the same triple.");
-    } else {
-      UserInputScanIndices.push_back(ScanIndex);
-    }
-  }
-
-  // Initialize the scan context.
-  const size_t NumScanInputs = ScannableJobIndices.size();
-  const bool HasStdlibModuleInputs = !StdlibModuleScanIndexByID.empty();
-
-  deps::DependencyScanningServiceOptions Opts;
-  Opts.LogPath = DepScanLogPath.str();
-  deps::DependencyScanningService ScanningService(std::move(Opts));
-
+  const size_t NumScanInputs = Requests.size();
   std::unique_ptr<llvm::ThreadPoolInterface> ThreadPool;
   std::unique_ptr<ScanningWorkerPool> WorkerPool;
-  std::tie(ThreadPool, WorkerPool) = createOptimalThreadAndWorkerPool(
-      NumScanInputs, HasStdlibModuleInputs, ScanningService);
+  std::tie(ThreadPool, WorkerPool) =
+      createOptimalThreadAndWorkerPool(NumScanInputs, ScanningService);
 
-  StdlibModuleScanScheduler StdlibModuleRegistry(StdlibModuleScanIndexByID);
-  ModuleLookupController LookupController(ModuleCachePath);
-
-  // Scan results are indexed by ScanIndex into ScannableJobIndices, not by
-  // JobIndex into Jobs. This allows one result slot per scannable job.
   SmallVector<std::optional<deps::TranslationUnitDeps>, 0> AllScanResults(
       NumScanInputs);
   SmallVector<SmallVector<StandaloneDiagnostic, 0>, 0> AllScanDiags(
       NumScanInputs);
   std::atomic<bool> HasError{false};
 
-  // Scans the job at the given scan index and schedules scans for any newly
-  // discovered Standard library module dependencies.
-  std::function<void(size_t)> ScanOneAndScheduleNew;
-  ScanOneAndScheduleNew = [&](size_t ScanIndex) {
-    const size_t JobIndex = ScannableJobIndices[ScanIndex];
-    const Command &Job = *Jobs[JobIndex];
-    auto [MaybeTUDeps, ScanDiags] = scanDependenciesForJob(
-        Job, *WorkerPool, WorkingDirectory, LookupController);
-
-    // Store diagnostics even for successful scans to also capture any warnings
-    // or notes.
-    assert(AllScanDiags[ScanIndex].empty() &&
-           "Each slot should be written to at most once.");
-    AllScanDiags[ScanIndex] = std::move(ScanDiags);
-
-    if (!MaybeTUDeps) {
-      HasError.store(true, std::memory_order_relaxed);
-      return;
-    }
-
-    // Schedule scans for newly discovered Standard library module dependencies.
-    const auto NewScanInputs = StdlibModuleRegistry.getNewScanInputs(
-        MaybeTUDeps->NamedModuleDeps, getTriple(Job));
-    for (const size_t NewScanIndex : NewScanInputs)
-      ThreadPool->async(
-          [&, NewScanIndex]() { ScanOneAndScheduleNew(NewScanIndex); });
-
-    assert(!AllScanResults[ScanIndex].has_value() &&
-           "Each slot should be written to at most once.");
-    AllScanResults[ScanIndex] = std::move(MaybeTUDeps);
-  };
-
-  // Initiate the scan with all jobs for user-provided inputs.
-  for (const size_t ScanIndex : UserInputScanIndices)
-    ThreadPool->async([&ScanOneAndScheduleNew, ScanIndex]() {
-      ScanOneAndScheduleNew(ScanIndex);
+  for (size_t ScanIndex = 0; ScanIndex < NumScanInputs; ++ScanIndex) {
+    const ScanRequest &Request = Requests[ScanIndex];
+    deps::DependencyActionController &Controller = GetController(*Request.Job);
+    ThreadPool->async([&, ScanIndex]() {
+      auto [MaybeTUDeps, ScanDiags] = scanDependenciesForJob(
+          Request, *WorkerPool, WorkingDirectory, Controller);
+      AllScanDiags[ScanIndex] = std::move(ScanDiags);
+      if (!MaybeTUDeps)
+        HasError.store(true, std::memory_order_relaxed);
+      AllScanResults[ScanIndex] = std::move(MaybeTUDeps);
     });
+  }
   ThreadPool->wait();
 
-  reportAllScanDiagnostics(std::move(AllScanDiags), Diags);
+  reportAllScanDiagnostics(std::move(AllScanDiags), DiagReporter);
   if (HasError.load(std::memory_order_relaxed))
     return std::nullopt;
 
-  // Collect results, mapping scan indices back to job indices.
-  DependencyScanResult Result;
-  for (auto &&[JobIndex, MaybeTUDeps] :
-       llvm::zip_equal(ScannableJobIndices, AllScanResults)) {
-    if (MaybeTUDeps) {
-      Result.ScannedJobIndices.push_back(JobIndex);
-      Result.ModuleDepGraphsForScannedJobs.push_back(
-          std::move(MaybeTUDeps->ModuleGraph));
-      Result.InputDepsForScannedJobs.push_back(
-          makeInputDeps(std::move(*MaybeTUDeps)));
-    } else
-      Result.UnusedStdlibModuleJobIndices.push_back(JobIndex);
-  }
-  Result.NonScannableJobIndices = std::move(NonScannableJobIndices);
-
-#ifndef NDEBUG
-  llvm::SmallDenseSet<size_t> SeenJobIndices;
-  SeenJobIndices.insert_range(Result.ScannedJobIndices);
-  SeenJobIndices.insert_range(Result.UnusedStdlibModuleJobIndices);
-  SeenJobIndices.insert_range(Result.NonScannableJobIndices);
-  assert(llvm::all_of(llvm::index_range(0, Jobs.size()),
-                      [&](size_t JobIndex) {
-                        return SeenJobIndices.contains(JobIndex);
-                      }) &&
-         "Scan result must partition all jobs");
-#endif
-
-  return Result;
+  SmallVector<deps::TranslationUnitDeps, 0> Results;
+  Results.reserve(NumScanInputs);
+  for (auto &MaybeTUDeps : AllScanResults)
+    Results.push_back(std::move(*MaybeTUDeps));
+  return Results;
 }
 
 namespace {
@@ -1106,10 +1012,17 @@ struct DOTGraphTraits<const CompilationGraph *> : DefaultDOTGraphTraits {
   static std::string getNodeLabel(NodeRef N, GraphRef) {
     return llvm::TypeSwitch<NodeRef, std::string>(N)
         .Case([](const ClangModuleJobNode *ClangModuleNode) {
-          const auto &ID = ClangModuleNode->MD.ID;
+          const auto &MD = ClangModuleNode->MD;
+          if (MD.IsCXXNamedModule)
+            return llvm::formatv(
+                       "Filename: {0} \\| Module type: Named module \\| "
+                       "Module name: {1} \\| Hash: {2}",
+                       MD.CXXNamedModuleSource, MD.ID.ModuleName,
+                       MD.ID.ContextHash)
+                .str();
           return llvm::formatv("Module type: Clang module \\| Module name: {0} "
                                "\\| Hash: {1}",
-                               ID.ModuleName, ID.ContextHash)
+                               MD.ID.ModuleName, MD.ID.ContextHash)
               .str();
         })
         .Case([](const NamedModuleJobNode *NamedModuleNode) {
@@ -1133,7 +1046,8 @@ struct DOTGraphTraits<const CompilationGraph *> : DefaultDOTGraphTraits {
   static std::string getNodeAttributes(NodeRef N, GraphRef) {
     switch (N->getKind()) {
     case CGNode::NodeKind::ClangModuleCC1Job:
-      return "fillcolor=1";
+      return cast<ClangModuleJobNode>(N)->MD.IsCXXNamedModule ? "fillcolor=2"
+                                                              : "fillcolor=1";
     case CGNode::NodeKind::NamedModuleCC1Job:
       return "fillcolor=2";
     case CGNode::NodeKind::NonModuleCC1Job:
@@ -1215,7 +1129,7 @@ static bool validateScannedJobInputKinds(
     const bool DefinesNamedModule = !InputDeps.ModuleName.empty();
 
     if (DefinesNamedModule && MainInput.getType() != types::TY_CXXModule &&
-        MainInput.getType() != types::TY_CXXStdModule) {
+        MainInput.getType() != types::TY_PP_CXXModule) {
       Diags.Report(diag::err_module_defined_outside_of_module_source)
           << InputDeps.ModuleName << MainInput.getFilename();
       return false;
@@ -1247,22 +1161,6 @@ static void createNodesForNonScannableJobs(
   }
 }
 
-/// Creates nodes for the Standard library module jobs not discovered as
-/// dependencies.
-///
-/// These and any dependent (non-image) job nodes should be pruned from the
-/// graph later.
-static SmallVector<JobNode *> createNodesForUnusedStdlibModuleJobs(
-    CompilationGraph &Graph,
-    SmallVectorImpl<std::unique_ptr<Command>> &&UnusedStdlibModuleJobs) {
-  SmallVector<JobNode *> StdlibModuleNodesToPrune;
-  for (auto &Job : UnusedStdlibModuleJobs) {
-    auto &NewNode = Graph.createJobNode<MiscJobNode>(std::move(Job));
-    StdlibModuleNodesToPrune.push_back(&NewNode);
-  }
-  return StdlibModuleNodesToPrune;
-}
-
 // Returns the derived argument list for the tool chain responsible
 // for creating \p Job.
 static const DerivedArgList &getToolChainArgs(Compilation &C,
@@ -1276,10 +1174,13 @@ static const DerivedArgList &getToolChainArgs(Compilation &C,
 /// Creates a job for the Clang module described by \p MD.
 static std::unique_ptr<Command>
 createClangModulePrecompileJob(Compilation &C, const Command &ImportingJob,
-                               const deps::ModuleDeps &MD) {
+                               const deps::ModuleDeps &MD, StringRef PCMPath) {
   DerivedArgList &Args = C.getArgs();
   const OptTable &Opts = C.getDriver().getOpts();
-  Arg *InputArg = makeInputArg(Args, Opts, "<discovered clang module>");
+  Arg *InputArg =
+      makeInputArg(Args, Opts,
+                   MD.IsCXXNamedModule ? "<discovered named module>"
+                                       : "<discovered clang module>");
   Action *IA = C.MakeAction<InputAction>(*InputArg, types::ID::TY_ModuleFile);
   Action *PA = C.MakeAction<PrecompileJobAction>(IA, types::ID::TY_ModuleFile);
   PA->propagateOffloadInfo(&ImportingJob.getSource());
@@ -1293,34 +1194,55 @@ createClangModulePrecompileJob(Compilation &C, const Command &ImportingJob,
     JobArgs.push_back(TCArgs.MakeArgString(Arg));
 
   const auto &D = C.getDriver();
+  const char *PCMPathArg = TCArgs.MakeArgString(PCMPath);
+  const InputInfo Output(types::TY_ModuleFile, PCMPathArg, PCMPathArg);
+  if (D.CC1Main && !D.CCGenDiagnostics)
+    return std::make_unique<CC1Command>(
+        *PA, ImportingJob.getCreator(), ResponseFileSupport::AtFileUTF8(),
+        D.getDriverProgramPath(), JobArgs,
+        /*Inputs=*/ArrayRef<InputInfo>{}, Output, D.getPrependArg());
   return std::make_unique<Command>(
       *PA, ImportingJob.getCreator(), ResponseFileSupport::AtFileUTF8(),
       D.getDriverProgramPath(), JobArgs,
-      /*Inputs=*/ArrayRef<InputInfo>{},
-      /*Outputs=*/ArrayRef<InputInfo>{}, D.getPrependArg());
+      /*Inputs=*/ArrayRef<InputInfo>{}, Output, D.getPrependArg());
 }
 
-/// Creates a \c ClangModuleJobNode with associated job for each unique Clang
-/// module in \p ModuleDepGraphsForScannedJobs.
+/// Creates a \c ClangModuleJobNode with associated job for each unique module
+/// in \p ModuleDepGraphsForScannedJobs.
 ///
-/// \param ImportingJobs Jobs whose module dependencies were scanned.
-/// \param ModuleDepGraphsForScannedJobs Full Clang module dependency graphs
-/// corresponding to \p ImportingJobs, in order.
-static void createClangModuleJobsAndNodes(
+/// Named modules defined by command-line inputs are not built by a separate
+/// job. Their IDs are instead recorded in \p OwnedNamedModules, mapped to the
+/// module name and triple.
+static void createModuleJobsAndNodes(
     CompilationGraph &Graph, Compilation &C,
     ArrayRef<std::unique_ptr<Command>> ImportingJobs,
-    SmallVectorImpl<deps::ModuleDepsGraph> &&ModuleDepGraphsForScannedJobs) {
+    SmallVectorImpl<deps::ModuleDepsGraph> &&ModuleDepGraphsForScannedJobs,
+    llvm::function_ref<ModulesDriverActionController &(const Command &)>
+        GetController,
+    llvm::DenseMap<deps::ModuleID, ModuleNameAndTriple> &OwnedNamedModules) {
   llvm::DenseSet<deps::ModuleID> AlreadySeen;
   for (auto &&[ImportingJob, ModuleDepsGraph] :
        llvm::zip_equal(llvm::make_pointee_range(ImportingJobs),
                        ModuleDepGraphsForScannedJobs)) {
+    auto &Controller = GetController(ImportingJob);
     for (auto &MD : ModuleDepsGraph) {
       const auto Inserted = AlreadySeen.insert(MD.ID).second;
       if (!Inserted)
         continue;
 
-      auto ClangModuleJob = createClangModulePrecompileJob(C, ImportingJob, MD);
-      Graph.createJobNode<ClangModuleJobNode>(std::move(ClangModuleJob),
+      if (Controller.getOwnedProvider(MD)) {
+        const ModuleNameAndTriple NameAndTriple{
+            C.getArgs().MakeArgString(MD.ID.ModuleName),
+            getTriple(ImportingJob)};
+        OwnedNamedModules.try_emplace(MD.ID, NameAndTriple);
+        continue;
+      }
+
+      const std::string PCMPath =
+          Controller.lookupModuleOutput(MD, deps::ModuleOutputKind::ModuleFile);
+      auto ModuleJob =
+          createClangModulePrecompileJob(C, ImportingJob, MD, PCMPath);
+      Graph.createJobNode<ClangModuleJobNode>(std::move(ModuleJob),
                                               std::move(MD));
     }
   }
@@ -1406,9 +1328,12 @@ static void createRegularEdges(CompilationGraph &Graph) {
 ///
 /// \returns false if there are multiple definitions for a named module, with
 /// diagnostics reported to \p Diags; otherwise returns true.
-static bool createModuleDependencyEdges(CompilationGraph &Graph,
-                                        DiagnosticsEngine &Diags) {
-  llvm::DenseMap<deps::ModuleID, CGNode *> ClangModuleNodeByID;
+static bool createModuleDependencyEdges(
+    CompilationGraph &Graph,
+    const llvm::DenseMap<deps::ModuleID, ModuleNameAndTriple>
+        &OwnedNamedModules,
+    DiagnosticsEngine &Diags) {
+  llvm::DenseMap<deps::ModuleID, CGNode *> ModuleNodeByID;
   llvm::DenseMap<ModuleNameAndTriple, CGNode *> NamedModuleNodeByID;
 
   // Map each module to the job that produces it.
@@ -1417,10 +1342,8 @@ static bool createModuleDependencyEdges(CompilationGraph &Graph,
     llvm::TypeSwitch<CGNode *>(Node)
         .Case([&](ClangModuleJobNode *ClangModuleNode) {
           [[maybe_unused]] const bool Inserted =
-              ClangModuleNodeByID.try_emplace(ClangModuleNode->MD.ID, Node)
-                  .second;
-          assert(Inserted &&
-                 "Multiple Clang module nodes with the same module ID!");
+              ModuleNodeByID.try_emplace(ClangModuleNode->MD.ID, Node).second;
+          assert(Inserted && "Multiple module nodes with the same module ID!");
         })
         .Case([&](NamedModuleJobNode *NamedModuleNode) {
           StringRef ModuleName = NamedModuleNode->InputDeps.ModuleName;
@@ -1444,83 +1367,28 @@ static bool createModuleDependencyEdges(CompilationGraph &Graph,
   if (HasDuplicateModuleError)
     return false;
 
+  // Named modules defined by command-line inputs are produced by those inputs'
+  // jobs.
+  for (const auto &[ID, NameAndTriple] : OwnedNamedModules)
+    if (auto *Node = NamedModuleNodeByID.lookup(NameAndTriple))
+      ModuleNodeByID.try_emplace(ID, Node);
+
   // Create edges from the module nodes to their importers.
   for (auto *Node : Graph) {
     llvm::TypeSwitch<CGNode *>(Node)
         .Case([&](ClangModuleJobNode *ClangModuleNode) {
-          connectEdgesViaLookup(Graph, *ClangModuleNode, ClangModuleNodeByID,
+          connectEdgesViaLookup(Graph, *ClangModuleNode, ModuleNodeByID,
                                 ClangModuleNode->MD.ClangModuleDeps,
                                 CGEdge::EdgeKind::ModuleDependency);
         })
         .Case([&](ScannedJobNode *NodeWithInputDeps) {
-          connectEdgesViaLookup(Graph, *NodeWithInputDeps, ClangModuleNodeByID,
+          connectEdgesViaLookup(Graph, *NodeWithInputDeps, ModuleNodeByID,
                                 NodeWithInputDeps->InputDeps.ClangModuleDeps,
-                                CGEdge::EdgeKind::ModuleDependency);
-
-          StringRef Triple = getTriple(*NodeWithInputDeps->Job);
-          const auto NamedModuleDepIDs =
-              llvm::map_range(NodeWithInputDeps->InputDeps.NamedModuleDeps,
-                              [&](StringRef ModuleName) {
-                                return ModuleNameAndTriple{ModuleName, Triple};
-                              });
-          connectEdgesViaLookup(Graph, *NodeWithInputDeps, NamedModuleNodeByID,
-                                NamedModuleDepIDs,
                                 CGEdge::EdgeKind::ModuleDependency);
         });
   }
 
   return true;
-}
-
-/// Prunes the compilation graph of any jobs which build Standard library
-/// modules not required in this compilation.
-static void
-pruneUnusedStdlibModuleJobs(CompilationGraph &Graph,
-                            ArrayRef<JobNode *> UnusedStdlibModuleJobNodes) {
-  // Collect all reachable non-image job nodes.
-  llvm::SmallPtrSet<JobNode *, 16> PrunableJobNodes;
-  for (auto *PrunableJobNodeRoot : UnusedStdlibModuleJobNodes) {
-    auto ReachableJobNodes =
-        llvm::map_range(llvm::depth_first(cast<CGNode>(PrunableJobNodeRoot)),
-                        llvm::CastTo<JobNode>);
-    auto ReachableNonImageNodes = llvm::make_filter_range(
-        ReachableJobNodes, [](auto *N) { return !llvm::isa<ImageJobNode>(N); });
-    PrunableJobNodes.insert_range(ReachableNonImageNodes);
-  }
-
-  // Map image job nodes to the prunable job nodes that feed into them.
-  llvm::DenseMap<ImageJobNode *, llvm::SmallPtrSet<JobNode *, 4>>
-      PrunableJobNodesByImageNode;
-  for (auto *PrunableJobNode : PrunableJobNodes) {
-    auto ReachableJobNodes = llvm::depth_first(cast<CGNode>(PrunableJobNode));
-    auto ReachableImageJobNodes = llvm::map_range(
-        llvm::make_filter_range(ReachableJobNodes, llvm::IsaPred<ImageJobNode>),
-        llvm::CastTo<ImageJobNode>);
-
-    for (auto *ImageNode : ReachableImageJobNodes)
-      PrunableJobNodesByImageNode[ImageNode].insert(PrunableJobNode);
-  }
-
-  // Remove from each affected image job node any arguments corresponding to
-  // outputs of the connected prunable job nodes.
-  for (auto &[ImageNode, PrunableJobNodeInputs] : PrunableJobNodesByImageNode) {
-    SmallVector<StringRef, 4> OutputsToRemove;
-    for (auto *JN : PrunableJobNodeInputs)
-      llvm::append_range(OutputsToRemove, JN->Job->getOutputFilenames());
-
-    auto NewArgs = ImageNode->Job->getArguments();
-    llvm::erase_if(NewArgs, [&](StringRef Arg) {
-      return llvm::is_contained(OutputsToRemove, Arg);
-    });
-    ImageNode->Job->replaceArguments(NewArgs);
-  }
-
-  // Erase all prunable job nodes from the graph.
-  for (auto *JN : PrunableJobNodes) {
-    // Nodes are owned by the graph, but we can release the associated job.
-    JN->Job.reset();
-    Graph.removeNode(*JN);
-  }
 }
 
 /// Creates the root node and connects it to all nodes with no incoming edges
@@ -1553,71 +1421,115 @@ static std::string createModuleOutputPath(const Compilation &C,
   return ModuleOutputPath;
 }
 
-/// Adds the '-fmodule-output=' argument for the module produced by \p Node.
-static void configureNamedModuleOutputArg(Compilation &C,
-                                          NamedModuleJobNode &Node,
-                                          StringRef ModuleOutputPath) {
-  auto &Job = *Node.Job;
-  const auto &TCArgs = getToolChainArgs(C, Job);
-  auto JobArgs = Job.getArguments();
-  JobArgs.push_back(
-      TCArgs.MakeArgString("-fmodule-output=" + ModuleOutputPath));
-  Job.replaceArguments(std::move(JobArgs));
-}
-
-/// Propagates the '-fmodule-file=' mapping for the named module described by
-/// \p Node to each dependent job.
-static void propagateModuleFileMappingArg(Compilation &C,
-                                          NamedModuleJobNode &Node,
-                                          StringRef ModuleOutputPath) {
-  const StringRef ModuleName = Node.InputDeps.ModuleName;
-
-  auto DependentNodes = llvm::drop_begin(llvm::depth_first<CGNode *>(&Node));
-  auto DependentScannedNodes = llvm::map_range(
-      llvm::make_filter_range(DependentNodes, llvm::IsaPred<ScannedJobNode>),
-      llvm::CastTo<ScannedJobNode>);
-
-  for (ScannedJobNode *DependentNode : DependentScannedNodes) {
-    auto &DependentJob = *DependentNode->Job;
-    const auto &TCArgs = getToolChainArgs(C, DependentJob);
-    auto JobArgs = DependentJob.getArguments();
-    JobArgs.push_back(TCArgs.MakeArgString("-fmodule-file=" + ModuleName + "=" +
-                                           ModuleOutputPath));
-    DependentJob.replaceArguments(std::move(JobArgs));
-  }
-}
-
-/// Finalizes command lines for C++20 named module dependencies.
+/// Configures the jobs of command-line inputs which define named modules.
 ///
-/// The command lines produced by dependency scanning are only adjusted to
-/// handle discovered Clang modules. For C++20 named modules, we update the
-/// command-lines here.
-static void fixupNamedModuleCommandLines(Compilation &C,
-                                         CompilationGraph &Graph) {
-  const auto NamedModuleNodes = llvm::map_range(
-      llvm::make_filter_range(Graph, llvm::IsaPred<NamedModuleJobNode>),
-      llvm::CastTo<NamedModuleJobNode>);
-
-  for (NamedModuleJobNode *Node : NamedModuleNodes) {
-    const auto &Job = *Node->Job;
-
-    // For Standard library modules, the driver already creates the module
-    // output as a temp file, so we can use that path directly.
-    const bool IsStdModule =
-        Job.getInputInfos().front().getType() == types::TY_CXXStdModule;
-    if (IsStdModule) {
-      StringRef ModuleOutputPath = Job.getOutputFilenames().front();
-      propagateModuleFileMappingArg(C, *Node, ModuleOutputPath);
+/// Such inputs are compiled in two phases: a precompile job builds the BMI,
+/// using the module build command produced by the dependency scan, and a
+/// second job compiles the BMI into an object file. That second job needs the
+/// same module file mappings as the precompile job.
+static void configureOwnedNamedModuleJobs(CompilationGraph &Graph) {
+  for (auto *Node : Graph) {
+    auto *NamedModuleNode = dyn_cast<NamedModuleJobNode>(Node);
+    if (!NamedModuleNode ||
+        !isa<PrecompileJobAction>(NamedModuleNode->Job->getSource()))
       continue;
+
+    SmallVector<const char *> ModuleFileArgs;
+    for (const char *Arg : NamedModuleNode->Job->getArguments())
+      if (StringRef(Arg).starts_with("-fmodule-file="))
+        ModuleFileArgs.push_back(Arg);
+
+    for (auto *Edge : Node->getEdges()) {
+      auto *Consumer = dyn_cast<JobNode>(&Edge->getTargetNode());
+      if (!Consumer || Edge->getKind() != CGEdge::EdgeKind::Regular ||
+          !isCC1Job(*Consumer->Job))
+        continue;
+      auto Args = Consumer->Job->getArguments();
+      llvm::append_range(Args, ModuleFileArgs);
+      Consumer->Job->replaceArguments(std::move(Args));
     }
-
-    const StringRef ModuleName = Node->InputDeps.ModuleName;
-    const auto ModuleOutputPath = createModuleOutputPath(C, ModuleName);
-    C.addTempFile(C.getArgs().MakeArgString(ModuleOutputPath));
-
-    configureNamedModuleOutputArg(C, *Node, ModuleOutputPath);
-    propagateModuleFileMappingArg(C, *Node, ModuleOutputPath);
   }
+}
+
+/// Makes each job's action depend on the actions of the jobs producing the
+/// modules it imports.
+///
+/// This way, jobs are not executed if any job they depend on failed, and the
+/// job dependencies can be determined from the actions alone.
+static void addModuleDependenciesToActions(CompilationGraph &Graph) {
+  for (auto *Node : Graph) {
+    auto *SrcNode = dyn_cast<JobNode>(Node);
+    if (!SrcNode)
+      continue;
+    for (auto *Edge : Node->getEdges()) {
+      if (Edge->getKind() != CGEdge::EdgeKind::ModuleDependency)
+        continue;
+      auto &DstNode = cast<JobNode>(Edge->getTargetNode());
+      auto &DstAction = const_cast<Action &>(DstNode.Job->getSource());
+      auto *SrcAction = const_cast<Action *>(&SrcNode->Job->getSource());
+      if (!llvm::is_contained(DstAction.getInputs(), SrcAction))
+        DstAction.getInputs().push_back(SrcAction);
+    }
+  }
+}
+
+/// Reports an error for each named module imported by a scanned job that is
+/// neither defined by any input nor provided by any module manifest.
+///
+/// \returns false if any errors were reported.
+static bool diagnoseUnresolvedNamedModuleImports(
+    ArrayRef<std::unique_ptr<Command>> ScannedJobs,
+    ArrayRef<InputDependencies> InputDepsForScannedJobs,
+    llvm::function_ref<const NamedModuleProviderMap &(const Command &)>
+        GetProviders,
+    const llvm::StringMap<std::string> &MissingManifestSources,
+    DiagnosticsEngine &Diags) {
+  bool Success = true;
+  for (const auto &&[Job, InputDeps] : llvm::zip_equal(
+           llvm::make_pointee_range(ScannedJobs), InputDepsForScannedJobs)) {
+    const auto &Providers = GetProviders(Job);
+    for (const auto &ModuleName : InputDeps.NamedModuleDeps) {
+      if (Providers.count(ModuleName))
+        continue;
+      if (const auto It = MissingManifestSources.find(ModuleName);
+          It != MissingManifestSources.end())
+        Diags.Report(diag::err_modules_driver_manifest_source_not_found)
+            << ModuleName << getFirstInputFilename(Job) << It->second;
+      else
+        Diags.Report(diag::err_modules_driver_named_module_not_found)
+            << ModuleName << getFirstInputFilename(Job);
+      Success = false;
+    }
+  }
+  return Success;
+}
+
+/// Returns the path of the BMI used by importers of the named module
+/// \p ModuleName, which is defined by the command-line input of the precompile
+/// job \p Job.
+static std::string getOwnedBMIPath(Compilation &C, const Command &Job,
+                                   StringRef ModuleName, bool ReducedBMI) {
+  // With full BMIs, importers use the main output of the precompile job.
+  if (!ReducedBMI)
+    return Job.getOutputFilenames().front();
+
+  // Respect an explicitly requested module output.
+  if (C.getArgs().hasArg(options::OPT_fmodule_output,
+                         options::OPT_fmodule_output_EQ))
+    for (StringRef Arg : llvm::reverse(Job.getArguments()))
+      if (Arg.consume_front("-fmodule-output="))
+        return Arg.str();
+
+  auto ModuleOutputPath = createModuleOutputPath(C, ModuleName);
+  C.addTempFile(C.getArgs().MakeArgString(ModuleOutputPath));
+  return ModuleOutputPath;
+}
+
+/// Returns true if \p Job compiles a C++ module unit, which may define a named
+/// module.
+static bool isModuleUnitJob(const Command &Job) {
+  const auto Type = Job.getInputInfos().front().getType();
+  return Type == types::TY_CXXModule || Type == types::TY_PP_CXXModule;
 }
 
 /// Moves jobs from \p Graph into \p C in the graph's topological order.
@@ -1638,20 +1550,14 @@ void driver::modules::runModulesDriver(
   llvm::PrettyStackTraceString CrashInfo("Running modules driver.");
 
   auto Jobs = C.getJobs().takeJobs();
-
-  const auto ManifestEntryBySource = buildManifestLookupMap(ManifestEntries);
-  // Apply manifest-entry specific command-line modifications before the scan as
-  // they might affect it.
-  applyArgsForStdModuleManifestInputs(C, ManifestEntryBySource, Jobs);
-
   DiagnosticsEngine &Diags = C.getDriver().getDiags();
 
-  // Run the dependency scan.
   const auto MaybeModuleCachePath = getModuleCachePath(C.getArgs());
   if (!MaybeModuleCachePath) {
     Diags.Report(diag::err_default_modules_cache_not_available);
     return;
   }
+  const std::string &ModuleCachePath = *MaybeModuleCachePath;
 
   auto MaybeCWD = C.getDriver().getVFS().getCurrentWorkingDirectory();
   const auto CWD = MaybeCWD ? std::move(*MaybeCWD) : ".";
@@ -1665,37 +1571,207 @@ void driver::modules::runModulesDriver(
     return;
   }
 
-  auto MaybeScanResults =
-      scanDependencies(Jobs, ManifestEntryBySource, *MaybeModuleCachePath, CWD,
-                       DepScanLogPath, Diags);
+  // The number of parallel jobs is used when executing the compilation.
+  if (const Arg *A =
+          C.getArgs().getLastArg(options::OPT_fmodules_driver_jobs_EQ)) {
+    unsigned NumJobs;
+    if (StringRef(A->getValue()).getAsInteger(10, NumJobs) || NumJobs == 0) {
+      Diags.Report(diag::err_drv_modules_driver_invalid_jobs) << A->getValue();
+      return;
+    }
+  }
+
+  deps::DependencyScanningServiceOptions Opts;
+  Opts.LogPath = DepScanLogPath.str();
+  deps::DependencyScanningService ScanningService(std::move(Opts));
+
+  // Reports the diagnostics of all scans. A single reporter is used, since it
+  // may install its own SourceManager into Diags.
+  StandaloneDiagReporter DiagReporter(Diags);
+
+  // Classify the jobs based on scan eligibility.
+  SmallVector<size_t> ScannableJobIndices;
+  SmallVector<size_t> NonScannableJobIndices;
+  for (const auto &&[Index, Job] : llvm::enumerate(Jobs)) {
+    if (isDependencyScannableJob(*Job))
+      ScannableJobIndices.push_back(Index);
+    else
+      NonScannableJobIndices.push_back(Index);
+  }
+
+  // Collect the named modules provided by the module manifests. These are
+  // built on demand, with their object code in a prebuilt library.
+  const bool ReducedBMI =
+      C.getArgs().hasFlag(options::OPT_fmodules_reduced_bmi,
+                          options::OPT_fno_modules_reduced_bmi, true);
+  // Entries from later manifests take precedence, so that manifests passed
+  // explicitly with -fmodules-manifest= override the Standard library
+  // manifest.
+  NamedModuleProviderMap ManifestProviders;
+  llvm::StringMap<std::string> MissingManifestSources;
+  for (const auto &Entry : ManifestEntries) {
+    if (!C.getDriver().getVFS().exists(Entry.SourcePath)) {
+      MissingManifestSources[Entry.LogicalName] = Entry.SourcePath;
+      ManifestProviders.erase(Entry.LogicalName);
+      continue;
+    }
+    MissingManifestSources.erase(Entry.LogicalName);
+    NamedModuleProvider Provider;
+    Provider.Source.SourcePath = Entry.SourcePath;
+    if (Entry.LocalArgs)
+      Provider.Source.SystemIncludeDirs = Entry.LocalArgs->SystemIncludeDirs;
+    Provider.Source.IsStdLibrary = Entry.IsStdlib;
+    Provider.Source.ReducedBMI = ReducedBMI;
+    ManifestProviders.insert_or_assign(Entry.LogicalName, std::move(Provider));
+  }
+
+  // The named modules available to inputs depend on their target, since the
+  // command-line inputs defining named modules are compiled per target.
+  llvm::StringMap<NamedModuleProviderMap> ProvidersByTriple;
+  auto GetProviders = [&](const Command &Job) -> NamedModuleProviderMap & {
+    auto [It, Inserted] = ProvidersByTriple.try_emplace(getTriple(Job));
+    if (Inserted)
+      It->second = ManifestProviders;
+    return It->second;
+  };
+
+  // Determine which named modules the command-line inputs define, by reading
+  // the module declarations of the module units. This needs neither the
+  // preprocessor nor the -cc1 command lines.
+  llvm::DenseMap<const Command *, std::string> OwnedModuleNameByJob;
+  {
+    SmallVector<std::pair<const Command *, std::string>> ModuleUnitJobs;
+    for (const size_t Index : ScannableJobIndices) {
+      const Command &Job = *Jobs[Index];
+      if (!isModuleUnitJob(Job))
+        continue;
+      // Standard input can only be read once, by the job itself.
+      StringRef Input = getFirstInputFilename(Job);
+      if (Input == "-")
+        continue;
+      auto Buffer = C.getDriver().getVFS().getBufferForFile(Input);
+      if (!Buffer)
+        continue;
+      auto Decl = scanInputForCXX20ModuleDeclaration((*Buffer)->getBuffer());
+      if (Decl && Decl->providesModule())
+        ModuleUnitJobs.emplace_back(&Job, std::move(Decl->Name));
+    }
+
+    llvm::DenseMap<ModuleNameAndTriple, const Command *> DefiningJobs;
+    bool HasDuplicateModuleError = false;
+    for (const auto &[Job, ModuleName] : ModuleUnitJobs) {
+      const auto [It, Inserted] = DefiningJobs.try_emplace(
+          {C.getArgs().MakeArgString(ModuleName), getTriple(*Job)}, Job);
+      if (!Inserted) {
+        Diags.Report(diag::err_modules_driver_named_module_redefinition)
+            << ModuleName << getFirstInputFilename(*It->second)
+            << getFirstInputFilename(*Job);
+        HasDuplicateModuleError = true;
+        continue;
+      }
+
+      // Modules defined by command-line inputs take precedence over modules
+      // from the manifests.
+      NamedModuleProvider Provider;
+      Provider.Source.SourcePath = getFirstInputFilename(*Job).str();
+      Provider.Source.ReducedBMI = ReducedBMI;
+      // If the input's job does not produce a BMI (e.g. with -fsyntax-only),
+      // the module is built by a dedicated BMI-only job instead.
+      if (isa<PrecompileJobAction>(Job->getSource()) &&
+          !Job->getOutputFilenames().empty()) {
+        Provider.OwnedBMIPath =
+            getOwnedBMIPath(C, *Job, ModuleName, ReducedBMI);
+        Provider.CodeGenBMIPath = Job->getOutputFilenames().front();
+        OwnedModuleNameByJob[Job] = ModuleName;
+      }
+      GetProviders(*Job).insert_or_assign(ModuleName, std::move(Provider));
+    }
+    if (HasDuplicateModuleError)
+      return;
+  }
+
+  // Scan all inputs. Imported named modules are built implicitly during the
+  // scan and reported like Clang modules.
+  llvm::StringMap<std::unique_ptr<ModulesDriverActionController>>
+      ControllersByTriple;
+  auto GetController =
+      [&](const Command &Job) -> ModulesDriverActionController & {
+    auto &Controller = ControllersByTriple[getTriple(Job)];
+    if (!Controller)
+      Controller = std::make_unique<ModulesDriverActionController>(
+          ModuleCachePath, &GetProviders(Job));
+    return *Controller;
+  };
+  // Create all controllers before scanning concurrently.
+  for (const size_t Index : ScannableJobIndices)
+    GetController(*Jobs[Index]);
+
+  // Modules defined by inputs are scanned by name, which builds them through
+  // the same implicit build as imports from other inputs. All other inputs are
+  // scanned as translation units.
+  SmallVector<ScanRequest> Requests;
+  for (const size_t Index : ScannableJobIndices) {
+    ScanRequest &Request = Requests.emplace_back();
+    Request.Job = Jobs[Index].get();
+    if (auto It = OwnedModuleNameByJob.find(Request.Job);
+        It != OwnedModuleNameByJob.end())
+      Request.ModuleName = It->second;
+  }
+  auto MaybeScanResults = scanJobs(
+      Requests, ScanningService,
+      [&](const Command &Job) -> deps::DependencyActionController & {
+        return GetController(Job);
+      },
+      CWD, DiagReporter);
   if (!MaybeScanResults) {
     Diags.Report(diag::err_dependency_scan_failed);
     return;
   }
-  auto &ScanResult = *MaybeScanResults;
+
+  SmallVector<deps::ModuleDepsGraph, 0> ModuleDepGraphsForScannedJobs;
+  SmallVector<InputDependencies, 0> InputDepsForScannedJobs;
+  for (auto &&[Request, TUDeps] :
+       llvm::zip_equal(Requests, *MaybeScanResults)) {
+    if (Request.ModuleName) {
+      auto InputDeps = makeInputDepsForOwnedModule(TUDeps, *Request.ModuleName);
+      if (!InputDeps) {
+        Diags.Report(diag::err_dependency_scan_failed);
+        return;
+      }
+      InputDepsForScannedJobs.push_back(std::move(*InputDeps));
+    } else {
+      InputDepsForScannedJobs.push_back(makeInputDeps(std::move(TUDeps)));
+    }
+    ModuleDepGraphsForScannedJobs.push_back(std::move(TUDeps.ModuleGraph));
+  }
 
   // Build the compilation graph.
   CompilationGraph Graph;
   createNodesForNonScannableJobs(
-      Graph, takeJobsAtIndices(Jobs, ScanResult.NonScannableJobIndices));
-  auto UnusedStdlibModuleJobNodes = createNodesForUnusedStdlibModuleJobs(
-      Graph, takeJobsAtIndices(Jobs, ScanResult.UnusedStdlibModuleJobIndices));
+      Graph, takeJobsAtIndices(Jobs, NonScannableJobIndices));
 
-  auto ScannedJobs = takeJobsAtIndices(Jobs, ScanResult.ScannedJobIndices);
-  if (!validateScannedJobInputKinds(ScannedJobs,
-                                    ScanResult.InputDepsForScannedJobs, Diags))
+  auto ScannedJobs = takeJobsAtIndices(Jobs, ScannableJobIndices);
+  if (!validateScannedJobInputKinds(ScannedJobs, InputDepsForScannedJobs,
+                                    Diags))
     return;
-  installScanCommandLines(C, ScannedJobs, ScanResult.InputDepsForScannedJobs);
+  if (!diagnoseUnresolvedNamedModuleImports(
+          ScannedJobs, InputDepsForScannedJobs,
+          [&](const Command &Job) -> const NamedModuleProviderMap & {
+            return GetProviders(Job);
+          },
+          MissingManifestSources, Diags))
+    return;
+  installScanCommandLines(C, ScannedJobs, InputDepsForScannedJobs);
 
-  createClangModuleJobsAndNodes(
-      Graph, C, /*ImportingJobs*/ ScannedJobs,
-      std::move(ScanResult.ModuleDepGraphsForScannedJobs));
+  llvm::DenseMap<deps::ModuleID, ModuleNameAndTriple> OwnedNamedModules;
+  createModuleJobsAndNodes(Graph, C, /*ImportingJobs*/ ScannedJobs,
+                           std::move(ModuleDepGraphsForScannedJobs),
+                           GetController, OwnedNamedModules);
   createNodesForScannedJobs(Graph, std::move(ScannedJobs),
-                            std::move(ScanResult.InputDepsForScannedJobs));
+                            std::move(InputDepsForScannedJobs));
 
   createRegularEdges(Graph);
-  pruneUnusedStdlibModuleJobs(Graph, UnusedStdlibModuleJobNodes);
-  if (!createModuleDependencyEdges(Graph, Diags))
+  if (!createModuleDependencyEdges(Graph, OwnedNamedModules, Diags))
     return;
   createAndConnectRoot(Graph);
 
@@ -1703,6 +1779,7 @@ void driver::modules::runModulesDriver(
   if (!Diags.isLastDiagnosticIgnored())
     llvm::WriteGraph<const CompilationGraph *>(llvm::errs(), &Graph);
 
-  fixupNamedModuleCommandLines(C, Graph);
+  configureOwnedNamedModuleJobs(Graph);
+  addModuleDependenciesToActions(Graph);
   feedJobsBackIntoCompilation(C, std::move(Graph));
 }

@@ -16,7 +16,9 @@
 #include "clang/Driver/ToolChain.h"
 #include "clang/Driver/Util.h"
 #include "clang/Options/Options.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/OptSpecifier.h"
@@ -28,6 +30,9 @@
 #include "llvm/TargetParser/Triple.h"
 #include <algorithm>
 #include <cassert>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -369,6 +374,122 @@ tryExecuteParallelOffloadJobGroup(const Driver &D, const ArgList &Args,
   return true;
 }
 
+/// Returns the number of jobs requested to run in parallel with
+/// -fmodules-driver-jobs=, or 1 if none were requested.
+static unsigned getModulesDriverJobs(const ArgList &Args) {
+  const Arg *A = Args.getLastArg(options::OPT_fmodules_driver_jobs_EQ);
+  if (!A || !Args.hasFlag(options::OPT_fmodules_driver,
+                          options::OPT_fno_modules_driver, false))
+    return 1;
+  unsigned NumJobs;
+  if (StringRef(A->getValue()).getAsInteger(10, NumJobs) || NumJobs == 0)
+    return 1;
+  return NumJobs;
+}
+
+/// Executes \p JobStorage, which is in topological order, using up to
+/// \p NumThreads threads.
+///
+/// A job is started once all jobs it depends on, as determined from the inputs
+/// of their actions, completed successfully. Jobs depending on a failed job are
+/// not executed. Jobs are always executed out-of-process, since in-process
+/// -cc1 invocations are not thread-safe.
+static void executeJobsInParallel(const Driver &D,
+                                  ArrayRef<std::optional<StringRef>> Redirects,
+                                  const JobList::list_type &JobStorage,
+                                  unsigned NumThreads,
+                                  FailingCommandList &FailingCommands) {
+  const size_t NumJobs = JobStorage.size();
+
+  // Map each action to the jobs created for it.
+  llvm::DenseMap<const Action *, SmallVector<size_t, 1>> JobsByAction;
+  for (const auto &&[Index, Job] : llvm::enumerate(JobStorage))
+    JobsByAction[&Job->getSource()].push_back(Index);
+
+  // Determine the direct job dependencies of each job.
+  SmallVector<unsigned> NumPendingDeps(NumJobs, 0);
+  SmallVector<SmallVector<size_t>> Dependents(NumJobs);
+  for (const auto &&[Index, Job] : llvm::enumerate(JobStorage)) {
+    llvm::SmallPtrSet<const Action *, 16> Visited;
+    llvm::SmallSetVector<size_t, 8> Deps;
+    SmallVector<const Action *> Worklist(Job->getSource().inputs());
+    while (!Worklist.empty()) {
+      const Action *A = Worklist.pop_back_val();
+      if (!Visited.insert(A).second)
+        continue;
+      // Stop at actions with jobs; their own dependencies are covered by them.
+      if (auto It = JobsByAction.find(A); It != JobsByAction.end()) {
+        for (size_t DepIndex : It->second)
+          if (DepIndex != Index)
+            Deps.insert(DepIndex);
+        continue;
+      }
+      llvm::append_range(Worklist, A->inputs());
+    }
+    NumPendingDeps[Index] = Deps.size();
+    for (size_t DepIndex : Deps)
+      Dependents[DepIndex].push_back(Index);
+  }
+
+  std::mutex Lock;
+  std::condition_variable CV;
+  SmallVector<size_t> Ready;
+  SmallVector<bool> Failed(NumJobs, false);
+  size_t NumFinished = 0;
+  size_t NumRunning = 0;
+  for (size_t Index = 0; Index < NumJobs; ++Index)
+    if (NumPendingDeps[Index] == 0)
+      Ready.push_back(Index);
+
+  // Marks \p Index as finished and schedules its dependents. Requires Lock.
+  std::function<void(size_t, bool)> Finish = [&](size_t Index, bool Fail) {
+    ++NumFinished;
+    for (size_t Dependent : Dependents[Index]) {
+      if (Fail)
+        Failed[Dependent] = true;
+      if (--NumPendingDeps[Dependent] == 0)
+        Ready.push_back(Dependent);
+    }
+  };
+
+  llvm::DefaultThreadPool Pool(llvm::hardware_concurrency(NumThreads));
+  std::unique_lock<std::mutex> UL(Lock);
+  while (NumFinished < NumJobs) {
+    while (!Ready.empty() && NumRunning < NumThreads) {
+      const size_t Index = Ready.pop_back_val();
+      if (Failed[Index]) {
+        // Don't run jobs whose dependencies failed.
+        Finish(Index, /*Fail=*/true);
+        continue;
+      }
+      ++NumRunning;
+      Pool.async([&, Index]() {
+        const Command &Job = *JobStorage[Index];
+        std::string Error;
+        bool ExecutionFailed = false;
+        const int Res =
+            Job.Command::Execute(Redirects, &Error, &ExecutionFailed);
+        std::scoped_lock<std::mutex> SL(Lock);
+        if (!Error.empty())
+          D.Diag(diag::err_drv_command_failure) << Error;
+        if (Res)
+          FailingCommands.push_back(
+              std::make_pair(ExecutionFailed ? 1 : Res, &Job));
+        --NumRunning;
+        Finish(Index, Res != 0);
+        CV.notify_one();
+      });
+    }
+    if (NumFinished < NumJobs)
+      CV.wait(UL, [&] {
+        return NumFinished == NumJobs ||
+               (!Ready.empty() && NumRunning < NumThreads);
+      });
+  }
+  UL.unlock();
+  Pool.wait();
+}
+
 void Compilation::ExecuteJobs(const JobList &Jobs,
                               FailingCommandList &FailingCommands,
                               bool LogOnly) const {
@@ -381,6 +502,16 @@ void Compilation::ExecuteJobs(const JobList &Jobs,
       !getDriver().CCPrintProcessStats && !getDriver().CCGenDiagnostics &&
       !getDriver().IsCLMode() && !getArgs().hasArg(options::OPT_v) &&
       Redirects.empty() && !PostCallback;
+
+  // With -fmodules-driver, independent jobs can run in parallel.
+  if (CanRunJobsInParallel) {
+    if (const unsigned NumThreads = getModulesDriverJobs(getArgs());
+        NumThreads > 1) {
+      executeJobsInParallel(getDriver(), Redirects, Jobs.getJobs(), NumThreads,
+                            FailingCommands);
+      return;
+    }
+  }
 
   // Jobs run as part of a parallel offload group. Group members are not
   // necessarily adjacent, so track them and skip them when the loop reaches

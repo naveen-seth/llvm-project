@@ -48,6 +48,8 @@ enum class CXX20ModuleDirectiveKind {
 };
 
 static CXX20ModuleDirectiveKind scanFirstCXX20ModuleDirective(StringRef Source);
+static std::optional<CXX20ModuleDeclaration>
+scanCXX20ModuleDeclarationImpl(StringRef Source);
 
 /// Does an efficient "scan" of the sources to detect the presence of
 /// preprocessor (or module import) directives and collects the raw lexed tokens
@@ -95,6 +97,8 @@ struct Scanner {
 
   friend CXX20ModuleDirectiveKind
   scanFirstCXX20ModuleDirective(StringRef Source);
+  friend std::optional<CXX20ModuleDeclaration>
+  scanCXX20ModuleDeclarationImpl(StringRef Source);
   friend bool clang::isPreprocessedModuleFile(StringRef Source);
 
 private:
@@ -1192,6 +1196,107 @@ scanFirstCXX20ModuleDirective(StringRef Source) {
 }
 
 } // namespace
+
+/// Skips the global module fragment, which may only contain preprocessing
+/// directives. Conditional blocks are skipped as a whole, since module
+/// directives cannot appear on lines controlled by preprocessor conditionals.
+static void skipGlobalModuleFragment(const char *&First,
+                                     const char *const End) {
+  unsigned ConditionalDepth = 0;
+  while (First != End) {
+    skipWhitespace(First, End);
+    if (const auto Len = isEOL(First, End)) {
+      First += Len;
+      continue;
+    }
+    if (First != End && *First == '#') {
+      ++First;
+      skipOverSpaces(First, End);
+      const char *NameBegin = First;
+      while (First != End && isAsciiIdentifierContinue(*First))
+        ++First;
+      const StringRef Name(NameBegin, First - NameBegin);
+      if (Name == "if" || Name == "ifdef" || Name == "ifndef")
+        ++ConditionalDepth;
+      else if (Name == "endif" && ConditionalDepth)
+        --ConditionalDepth;
+      skipToNewlineRaw(First, End);
+      continue;
+    }
+    if (ConditionalDepth == 0)
+      return;
+    skipToNewlineRaw(First, End);
+  }
+}
+
+namespace {
+std::optional<CXX20ModuleDeclaration>
+scanCXX20ModuleDeclarationImpl(StringRef Source) {
+  const char *First = Source.begin();
+  const char *const End = Source.end();
+
+  llvm::SmallVector<dependency_directives_scan::Token> Tokens;
+  StringRef DirectiveInput;
+  // Lexes the C++20 module directive at First, if any.
+  auto LexModuleDirective = [&]() -> std::optional<DirectiveKind> {
+    if (First == End || !(*First == 'i' || *First == 'e' || *First == 'm'))
+      return std::nullopt;
+    Tokens.clear();
+    DirectiveInput = StringRef(First, End - First);
+    Scanner S(DirectiveInput, Tokens, nullptr, SourceLocation());
+    S.TheLexer.setParsingPreprocessorDirective(true);
+    if (S.lexModule(First, End) || S.DirsWithToks.empty())
+      return std::nullopt;
+    return S.DirsWithToks.front().Kind;
+  };
+
+  skipUntilMaybeCXX20ModuleDirective(First, End);
+  std::optional<DirectiveKind> Kind = LexModuleDirective();
+  if (!Kind)
+    return std::nullopt;
+
+  // A global module fragment is followed by the module declaration.
+  if (*Kind == dependency_directives_scan::cxx_module_decl &&
+      Tokens.size() >= 2 && Tokens[1].is(tok::semi)) {
+    skipGlobalModuleFragment(First, End);
+    Kind = LexModuleDirective();
+    if (!Kind)
+      return std::nullopt;
+  }
+
+  if (*Kind != dependency_directives_scan::cxx_module_decl &&
+      *Kind != dependency_directives_scan::cxx_export_module_decl)
+    return std::nullopt;
+
+  CXX20ModuleDeclaration Decl;
+  Decl.IsExported = *Kind == dependency_directives_scan::cxx_export_module_decl;
+
+  // Skip 'export' and 'module', then collect the module name up to the
+  // semicolon or the attributes.
+  for (size_t I = Decl.IsExported ? 2 : 1; I < Tokens.size(); ++I) {
+    const dependency_directives_scan::Token &Tok = Tokens[I];
+    if (Tok.is(tok::raw_identifier) || Tok.is(tok::period)) {
+      Decl.Name += DirectiveInput.substr(Tok.Offset, Tok.Length);
+    } else if (Tok.is(tok::colon) && !Decl.IsPartition) {
+      Decl.IsPartition = true;
+      Decl.Name += ':';
+    } else if (Tok.is(tok::semi) || Tok.is(tok::l_square)) {
+      break;
+    } else {
+      return std::nullopt;
+    }
+  }
+
+  if (Decl.Name.empty() || Decl.Name.back() == '.' || Decl.Name.back() == ':')
+    return std::nullopt;
+  return Decl;
+}
+} // namespace
+
+std::optional<CXX20ModuleDeclaration>
+clang::scanInputForCXX20ModuleDeclaration(StringRef Source) {
+  return scanCXX20ModuleDeclarationImpl(Source);
+}
 
 bool clang::scanInputForCXX20ModulesUsage(StringRef Source) {
   return scanFirstCXX20ModuleDirective(Source) !=

@@ -1289,6 +1289,70 @@ TEST(MinimizeSourceToDependencyDirectivesTest, ScanningPreprocessedModuleFile) {
   ASSERT_TRUE(clang::isPreprocessedModuleFile(Source));
 }
 
+TEST(MinimizeSourceToDependencyDirectivesTest, CXX20ModuleDeclaration) {
+  auto Scan = [](StringRef Source) {
+    return scanInputForCXX20ModuleDeclaration(Source);
+  };
+
+  // Not a module unit.
+  EXPECT_FALSE(Scan("int x;"));
+  EXPECT_FALSE(Scan("import M;"));
+  EXPECT_FALSE(Scan("export import M;"));
+  EXPECT_FALSE(Scan("module;"));
+  EXPECT_FALSE(Scan("module; int x;"));
+
+  // Interface units, partitions and implementation units.
+  auto Decl = Scan("export module M;");
+  ASSERT_TRUE(Decl);
+  EXPECT_EQ("M", Decl->Name);
+  EXPECT_TRUE(Decl->IsExported);
+  EXPECT_FALSE(Decl->IsPartition);
+  EXPECT_TRUE(Decl->providesModule());
+
+  Decl = Scan("export module a.b.c:p.q [[attr]];");
+  ASSERT_TRUE(Decl);
+  EXPECT_EQ("a.b.c:p.q", Decl->Name);
+  EXPECT_TRUE(Decl->IsPartition);
+
+  Decl = Scan("module M:impl;");
+  ASSERT_TRUE(Decl);
+  EXPECT_EQ("M:impl", Decl->Name);
+  EXPECT_FALSE(Decl->IsExported);
+  EXPECT_TRUE(Decl->providesModule());
+
+  Decl = Scan("module M;");
+  ASSERT_TRUE(Decl);
+  EXPECT_EQ("M", Decl->Name);
+  EXPECT_FALSE(Decl->providesModule());
+
+  // A global module fragment, with comments, line splices, and conditional
+  // blocks, including text in skipped groups.
+  Decl = Scan(R"(
+    // Leading comment.
+    module;
+    #include "a.h"
+    #ifdef X
+    #include "b.h"
+    int skipped_text;
+    #else
+    #define Y \
+      1
+    #endif
+    /* comment */
+    export module M;
+  )");
+  ASSERT_TRUE(Decl);
+  EXPECT_EQ("M", Decl->Name);
+
+  // A module declaration inside a conditional is ill-formed, and not found.
+  EXPECT_FALSE(Scan(R"(
+    module;
+    #if 1
+    export module M;
+    #endif
+  )"));
+}
+
 TEST(MinimizeSourceToDependencyDirectivesTest, CXX20ModuleUnitKind) {
   EXPECT_FALSE(scanInputForCXX20ModulesUsage("int x;"));
   EXPECT_TRUE(scanInputForCXX20ModulesUsage("module;"));

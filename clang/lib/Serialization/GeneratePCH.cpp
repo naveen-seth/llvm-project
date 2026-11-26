@@ -19,6 +19,8 @@
 #include "clang/Sema/SemaConsumer.h"
 #include "clang/Serialization/ASTWriter.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 
 using namespace clang;
 
@@ -124,6 +126,11 @@ void CXX20ModulesGenerator::HandleTranslationUnit(ASTContext &Ctx) {
     return;
 
   std::error_code EC;
+  // The BMI may be written into a directory that doesn't exist yet, such as a
+  // module cache subdirectory.
+  if (StringRef Dir = llvm::sys::path::parent_path(getOutputFile());
+      !Dir.empty())
+    EC = llvm::sys::fs::create_directories(Dir);
   auto OS = std::make_unique<llvm::raw_fd_ostream>(getOutputFile(), EC);
   if (EC) {
     getDiagnostics().Report(diag::err_fe_unable_to_open_output)

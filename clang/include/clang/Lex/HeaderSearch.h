@@ -714,6 +714,17 @@ public:
   ModuleFileName getCachedModuleFileName(StringRef ModuleName,
                                          StringRef ModuleMapPath);
 
+  /// Retrieve the name of the cached module file of the C++20 named module
+  /// \p ModuleName, if it is built implicitly from an interface source listed
+  /// in \c HeaderSearchOptions::NamedModuleSources.
+  ///
+  /// The module file is uniqued by the path of its interface source, so that
+  /// both the build and readers of importing module files agree on it.
+  ///
+  /// \returns The name of the module file, or an empty string if the module
+  /// has no listed interface source.
+  ModuleFileName getCachedNamedModuleFileName(StringRef ModuleName);
+
   /// Lookup a module Search for a module with the given name.
   ///
   /// \param ModuleName The name of the module we're looking for.

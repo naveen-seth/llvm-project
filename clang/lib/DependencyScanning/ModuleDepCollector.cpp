@@ -152,6 +152,17 @@ void ModuleDepCollector::addOutputPaths(CowCompilerInvocation &CI,
                                         ModuleDeps &Deps) {
   CI.getMutFrontendOpts().OutputFile =
       Controller.lookupModuleOutput(Deps, ModuleOutputKind::ModuleFile);
+  if (Deps.IsCXXNamedModule) {
+    // The full BMI used to compile the object code is the main output. The
+    // BMI used by importers is then emitted as a by-product, if it differs.
+    std::string CodeGenBMI = Controller.lookupNamedModuleCodeGenOutput(Deps);
+    if (!CodeGenBMI.empty()) {
+      if (CI.getFrontendOpts().GenReducedBMI)
+        CI.getMutFrontendOpts().ModuleOutputPath =
+            CI.getFrontendOpts().OutputFile;
+      CI.getMutFrontendOpts().OutputFile = std::move(CodeGenBMI);
+    }
+  }
   if (!CI.getDiagnosticOpts().DiagnosticSerializationFile.empty())
     CI.getMutDiagnosticOpts().DiagnosticSerializationFile =
         Controller.lookupModuleOutput(
@@ -281,6 +292,10 @@ makeCommonInvocationForModuleBuild(CompilerInvocation CI) {
   CI.getFrontendOpts().ProgramAction = frontend::GenerateModule;
   CI.getLangOpts().ModuleName.clear();
 
+  // Named module sources are only used to build modules implicitly while
+  // scanning.
+  CI.getHeaderSearchOpts().NamedModuleSources.clear();
+
   // Remove any macro definitions that are explicitly ignored.
   if (!CI.getHeaderSearchOpts().ModulesIgnoreMacros.empty()) {
     llvm::erase_if(
@@ -314,6 +329,10 @@ ModuleDepCollector::getInvocationAdjustedForModuleBuildWithoutOutputs(
     const ModuleDeps &Deps,
     llvm::function_ref<void(CowCompilerInvocation &)> Optimize) const {
   CowCompilerInvocation CI = CommonInvocation;
+
+  if (Deps.IsCXXNamedModule)
+    return getInvocationAdjustedForNamedModuleBuildWithoutOutputs(Deps, CI,
+                                                                  Optimize);
 
   CI.getMutLangOpts().ModuleName = Deps.ID.ModuleName;
   CI.getMutFrontendOpts().IsSystemModule = Deps.IsSystem;
@@ -352,6 +371,63 @@ ModuleDepCollector::getInvocationAdjustedForModuleBuildWithoutOutputs(
   return CI;
 }
 
+CowCompilerInvocation
+ModuleDepCollector::getInvocationAdjustedForNamedModuleBuildWithoutOutputs(
+    const ModuleDeps &Deps, CowCompilerInvocation &CI,
+    llvm::function_ref<void(CowCompilerInvocation &)> Optimize) const {
+  const auto &Sources = ScanInstance.getHeaderSearchOpts().NamedModuleSources;
+  auto SourceIt = Sources.find(Deps.ID.ModuleName);
+  const HeaderSearchOptions::NamedModuleSource *Source =
+      SourceIt == Sources.end() ? nullptr : &SourceIt->second;
+
+  // Explicitly build the BMI from the module unit source. If the object code
+  // of the module is compiled from its BMI, a full BMI is required, with the
+  // Reduced BMI for importers emitted as a by-product.
+  const bool ReducedBMI = !Source || Source->ReducedBMI;
+  if (!Controller.lookupNamedModuleCodeGenOutput(Deps).empty()) {
+    CI.getMutFrontendOpts().ProgramAction = frontend::GenerateModuleInterface;
+    if (ReducedBMI) {
+      CI.getMutFrontendOpts().GenReducedBMI = true;
+      // The final path is computed in addOutputPaths.
+      CI.getMutFrontendOpts().ModuleOutputPath = "-";
+    }
+  } else {
+    CI.getMutFrontendOpts().ProgramAction =
+        ReducedBMI ? frontend::GenerateReducedModuleInterface
+                   : frontend::GenerateModuleInterface;
+  }
+  CI.getMutFrontendOpts().IsSystemModule = false;
+  CI.getMutFrontendOpts().Inputs.emplace_back(Deps.CXXNamedModuleSource,
+                                              InputKind(Language::CXX));
+
+  CI.getMutFrontendOpts().ModuleMapFiles.clear();
+  llvm::append_range(CI.getMutFrontendOpts().ModuleMapFiles,
+                     Deps.ModuleMapFileDeps);
+
+  for (const auto &PrebuiltModule : Deps.PrebuiltModuleDeps)
+    CI.getMutFrontendOpts().ModuleFiles.push_back(PrebuiltModule.PCMFile);
+
+  addModuleFiles(CI, Deps.ClangModuleDeps);
+
+  CI.getMutDiagnosticOpts().SystemHeaderWarningsModules.clear();
+
+  Optimize(CI);
+
+  // Apply the module-specific arguments after optimizing, since they did not
+  // take part in the scan.
+  if (Source) {
+    for (const std::string &Dir : Source->SystemIncludeDirs)
+      CI.getMutHeaderSearchOpts().AddPath(Dir, frontend::System,
+                                          /*IsFramework=*/false,
+                                          /*IgnoreSysRoot=*/true);
+    if (Source->IsStdLibrary)
+      CI.getMutDiagnosticOpts().Warnings.push_back(
+          "no-reserved-module-identifier");
+  }
+
+  return CI;
+}
+
 static void
 collectModuleMap(std::vector<std::string> &ModuleMapFiles,
                  llvm::SmallDenseSet<const FileEntry *, 16> &SeenModuleMapFiles,
@@ -377,6 +453,9 @@ void ModuleDepCollector::collectModuleMapFiles(
   for (const ModuleID &MID : ClangModuleDeps) {
     ModuleDeps *MD = ModuleDepsByID.lookup(MID);
     assert(MD && "Inconsistent dependency info");
+    // C++20 named modules are not defined by module maps.
+    if (MD->IsCXXNamedModule)
+      continue;
     // TODO: Track ClangModuleMapFile as `FileEntryRef`.
     auto FE = ScanInstance.getFileManager().getOptionalFileRef(
         MD->ClangModuleMapFile);
@@ -390,14 +469,48 @@ void ModuleDepCollector::collectModuleMapFiles(
   }
 }
 
+/// Collects the C++20 named modules that \p Deps transitively depend on.
+///
+/// Unlike Clang modules, importers of named modules need a module file mapping
+/// for every transitively imported named module.
+static SmallVector<ModuleID> collectTransitiveNamedModuleDeps(
+    ArrayRef<ModuleID> Deps,
+    const llvm::DenseMap<ModuleID, ModuleDeps *> &ModuleDepsByID) {
+  SmallVector<ModuleID> Result;
+  llvm::DenseSet<ModuleID> Seen(llvm::from_range, Deps);
+  SmallVector<ModuleID> Worklist(Deps);
+  while (!Worklist.empty()) {
+    ModuleID ID = Worklist.pop_back_val();
+    ModuleDeps *MD = ModuleDepsByID.lookup(ID);
+    if (!MD)
+      continue;
+    for (const ModuleID &Dep : MD->ClangModuleDeps) {
+      if (!Seen.insert(Dep).second)
+        continue;
+      Worklist.push_back(Dep);
+      if (ModuleDeps *DepMD = ModuleDepsByID.lookup(Dep);
+          DepMD && DepMD->IsCXXNamedModule)
+        Result.push_back(Dep);
+    }
+  }
+  return Result;
+}
+
 void ModuleDepCollector::addModuleFiles(
     CompilerInvocation &CI, ArrayRef<ModuleID> ClangModuleDeps) const {
+  for (const ModuleID &MID :
+       collectTransitiveNamedModuleDeps(ClangModuleDeps, ModuleDepsByID)) {
+    ModuleDeps *MD = ModuleDepsByID.lookup(MID);
+    CI.getHeaderSearchOpts().PrebuiltModuleFiles.insert(
+        {MID.ModuleName,
+         Controller.lookupModuleOutput(*MD, ModuleOutputKind::ModuleFile)});
+  }
   for (const ModuleID &MID : ClangModuleDeps) {
     ModuleDeps *MD = ModuleDepsByID.lookup(MID);
     std::string PCMPath =
         Controller.lookupModuleOutput(*MD, ModuleOutputKind::ModuleFile);
 
-    if (Service.getOpts().EagerLoadModules)
+    if (Service.getOpts().EagerLoadModules && !MD->IsCXXNamedModule)
       CI.getFrontendOpts().ModuleFiles.push_back(std::move(PCMPath));
     else
       CI.getHeaderSearchOpts().PrebuiltModuleFiles.insert(
@@ -407,12 +520,19 @@ void ModuleDepCollector::addModuleFiles(
 
 void ModuleDepCollector::addModuleFiles(
     CowCompilerInvocation &CI, ArrayRef<ModuleID> ClangModuleDeps) const {
+  for (const ModuleID &MID :
+       collectTransitiveNamedModuleDeps(ClangModuleDeps, ModuleDepsByID)) {
+    ModuleDeps *MD = ModuleDepsByID.lookup(MID);
+    CI.getMutHeaderSearchOpts().PrebuiltModuleFiles.insert(
+        {MID.ModuleName,
+         Controller.lookupModuleOutput(*MD, ModuleOutputKind::ModuleFile)});
+  }
   for (const ModuleID &MID : ClangModuleDeps) {
     ModuleDeps *MD = ModuleDepsByID.lookup(MID);
     std::string PCMPath =
         Controller.lookupModuleOutput(*MD, ModuleOutputKind::ModuleFile);
 
-    if (Service.getOpts().EagerLoadModules)
+    if (Service.getOpts().EagerLoadModules && !MD->IsCXXNamedModule)
       CI.getMutFrontendOpts().ModuleFiles.push_back(std::move(PCMPath));
     else
       CI.getMutHeaderSearchOpts().PrebuiltModuleFiles.insert(
@@ -433,6 +553,7 @@ static bool needsModules(FrontendInputFile FIF) {
 
 void ModuleDepCollector::applyDiscoveredDependencies(CompilerInvocation &CI) {
   CI.clearImplicitModuleBuildOptions();
+  CI.getHeaderSearchOpts().NamedModuleSources.clear();
   resetBenignCodeGenOptions(CI.getFrontendOpts().ProgramAction,
                             CI.getLangOpts(), CI.getCodeGenOpts());
   CI.getDependencyOutputOpts().IncludeModuleFiles = MFDK_Direct;
@@ -585,11 +706,39 @@ public:
                     const Module *Imported) override {
     auto &PP = MDC.ScanInstance.getPreprocessor();
     if (PP.getLangOpts().CPlusPlusModules && PP.isImportingCXXNamedModules()) {
-      MDC.addRequiredStdCXXModule(Path[0].getIdentifierInfo()->getName());
+      StringRef ModuleName = Path[0].getIdentifierInfo()->getName();
+      MDC.addRequiredStdCXXModule(ModuleName);
+      loadImplicitNamedModule(ImportLoc, ModuleName);
       return;
     }
 
     MDC.handleImport(Imported);
+  }
+
+  void EndOfMainFile() override {
+    // A module implementation unit implicitly imports its primary module
+    // interface.
+    auto &PP = MDC.ScanInstance.getPreprocessor();
+    if (PP.isInImplementationUnit()) {
+      SourceManager &SM = MDC.ScanInstance.getSourceManager();
+      loadImplicitNamedModule(SM.getLocForStartOfFile(SM.getMainFileID()),
+                              PP.getNamedModuleName());
+    }
+  }
+
+private:
+  /// Implicitly builds and loads the C++20 named module \p ModuleName, if its
+  /// interface source was provided for scanning.
+  void loadImplicitNamedModule(SourceLocation ImportLoc, StringRef ModuleName) {
+    CompilerInstance &CI = MDC.ScanInstance;
+    if (!CI.getHeaderSearchOpts().NamedModuleSources.count(ModuleName))
+      return;
+    IdentifierLoc ModuleId(ImportLoc,
+                           CI.getPreprocessor().getIdentifierInfo(ModuleName));
+    ModuleLoadResult Result = CI.loadModule(ImportLoc, ModuleId, Module::Hidden,
+                                            /*IsInclusionDirective=*/false);
+    if (Module *M = Result)
+      MDC.handleImport(M);
   }
 };
 
@@ -737,6 +886,14 @@ ModuleDepCollector::handleTopLevelModule(serialization::ModuleFile *MF) {
   MD.ID.ModuleName = MF->ModuleName;
   MD.IsSystem = M->IsSystem;
 
+  if (M->isNamedModule()) {
+    MD.IsCXXNamedModule = true;
+    const auto &Sources =
+        MDC.ScanInstance.getHeaderSearchOpts().NamedModuleSources;
+    if (auto It = Sources.find(MF->ModuleName); It != Sources.end())
+      MD.CXXNamedModuleSource = It->second.SourcePath;
+  }
+
   // Start off with the assumption that this module is shareable when there
   // are stable directories. As more dependencies are discovered, check if those
   // come from the provided directories.
@@ -750,8 +907,10 @@ ModuleDepCollector::handleTopLevelModule(serialization::ModuleFile *MF) {
   ModuleMap &ModMapInfo =
       MDC.ScanInstance.getPreprocessor().getHeaderSearchInfo().getModuleMap();
 
+  // C++20 named modules are not defined by module maps.
   OptionalFileEntryRef CurrentModuleMapEntry =
-      ModMapInfo.getModuleMapFileForUniquing(M);
+      M->isNamedModule() ? std::nullopt
+                         : ModMapInfo.getModuleMapFileForUniquing(M);
   if (CurrentModuleMapEntry) {
     SmallString<128> Path = CurrentModuleMapEntry->getNameAsRequested();
     ModMapInfo.canonicalizeModuleMapPath(Path);

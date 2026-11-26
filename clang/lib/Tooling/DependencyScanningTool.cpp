@@ -298,30 +298,6 @@ initVFSForTUBufferScanning(ArrayRef<std::string> CommandLine,
   return std::make_pair(std::move(FS), ModifiedCommandLine);
 }
 
-static std::pair<IntrusiveRefCntPtr<llvm::vfs::FileSystem>,
-                 std::vector<std::string>>
-initVFSForByNameScanning(ArrayRef<std::string> CommandLine) {
-  // The fake input buffer is read-only, and it is used to produce unique source
-  // locations for the diagnostics. Therefore, sharing this global buffer across
-  // threads is ok.
-  static const std::string FakeInput(
-      DependencyScanningWorker::MaxNumOfByNameQueries, ' ');
-
-  StringRef InputPath =
-      llvm::sys::path::is_style_windows(llvm::sys::path::Style::native)
-          ? "Z:\\module-include.input"
-          : "/module-include.input";
-  auto InputBuf = llvm::MemoryBuffer::getMemBuffer(FakeInput, InputPath);
-
-  auto FS = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
-  FS->addFile(InputPath, 0, std::move(InputBuf));
-
-  std::vector<std::string> ModifiedCommandLine(CommandLine);
-  ModifiedCommandLine.emplace_back(InputPath);
-
-  return std::make_pair(std::move(FS), ModifiedCommandLine);
-}
-
 std::optional<TranslationUnitDeps>
 DependencyScanningTool::getTranslationUnitDependencies(
     ArrayRef<std::string> CommandLine, StringRef CWD,

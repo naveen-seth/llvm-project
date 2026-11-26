@@ -457,6 +457,10 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
 - Added `-Rmodules-driver` option to emit remarks for `-fmodules-driver`,
   such as the build graph with module dependencies as a DOT graph.
 
+- Added `-fmodules-manifest=` option to pass additional C++ module manifests
+  to `-fmodules-driver`, and `-fmodules-driver-jobs=` option to run independent
+  jobs of `-fmodules-driver` in parallel.
+
 ### Deprecated Compiler Flags
 
 ### Modified Compiler Flags

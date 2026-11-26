@@ -1,6 +1,7 @@
-// This test checks the on-demand scanning of system inputs, in particular:
-// 1. System inputs are scanned only when needed.
-// 2. Imports between system modules are supported.
+// This test checks the on-demand building of modules from the module manifest,
+// in particular:
+// 1. Manifest modules are only built when imported.
+// 2. Imports between manifest modules are supported.
 
 // RUN: split-file %s %t
 
@@ -36,15 +37,16 @@
 //
 // CHECK-DAG:          "[[PREFIX]]/main.cpp-x86_64-unknown-linux-gnu" [fillcolor=3, label="{ Filename: [[PREFIX]]/main.cpp | Triple: x86_64-unknown-linux-gnu }"];
 // CHECK-DAG:          "[[PREFIX]]/foo.cpp-x86_64-unknown-linux-gnu" [fillcolor=3, label="{ Filename: [[PREFIX]]/foo.cpp | Triple: x86_64-unknown-linux-gnu }"];
-// CHECK-DAG:          "std-x86_64-unknown-linux-gnu" [fillcolor=2, label="{ Filename: {{.*}} | Module type: Named module | Module name: std | Triple: x86_64-unknown-linux-gnu }"];
-// CHECK-DAG:          "std.compat-x86_64-unknown-linux-gnu" [fillcolor=2, label="{ Filename: {{.*}} | Module type: Named module | Module name: std.compat | Triple: x86_64-unknown-linux-gnu }"];
-// CHECK-DAG:          "core-x86_64-unknown-linux-gnu" [fillcolor=2, label="{ Filename: {{.*}} | Module type: Named module | Module name: core | Triple: x86_64-unknown-linux-gnu }"];
+// CHECK-DAG:          "[[STD:std-[A-Z0-9]+]]" [fillcolor=2, label="{ Filename: {{.*}}/std.cppm | Module type: Named module | Module name: std | Hash: {{[A-Z0-9]+}} }"];
+// CHECK-DAG:          "[[STD_COMPAT:std.compat-[A-Z0-9]+]]" [fillcolor=2, label="{ Filename: {{.*}}/std.compat.cppm | Module type: Named module | Module name: std.compat | Hash: {{[A-Z0-9]+}} }"];
+// CHECK-DAG:          "[[CORE:core-[A-Z0-9]+]]" [fillcolor=2, label="{ Filename: {{.*}}/core.cppm | Module type: Named module | Module name: core | Hash: {{[A-Z0-9]+}} }"];
+// CHECK-NOT:          unused
 //
-// CHECK-DAG:          "std-x86_64-unknown-linux-gnu" -> "[[PREFIX]]/main.cpp-x86_64-unknown-linux-gnu";
-// CHECK-DAG:          "std-x86_64-unknown-linux-gnu" -> "[[PREFIX]]/foo.cpp-x86_64-unknown-linux-gnu";
-// CHECK-DAG:          "std-x86_64-unknown-linux-gnu" -> "std.compat-x86_64-unknown-linux-gnu";
-// CHECK-DAG:          "std.compat-x86_64-unknown-linux-gnu" -> "[[PREFIX]]/main.cpp-x86_64-unknown-linux-gnu";
-// CHECK-DAG:          "core-x86_64-unknown-linux-gnu" -> "[[PREFIX]]/foo.cpp-x86_64-unknown-linux-gnu";
+// CHECK-DAG:          "[[STD]]" -> "[[PREFIX]]/main.cpp-x86_64-unknown-linux-gnu";
+// CHECK-DAG:          "[[STD]]" -> "[[PREFIX]]/foo.cpp-x86_64-unknown-linux-gnu";
+// CHECK-DAG:          "[[STD]]" -> "[[STD_COMPAT]]";
+// CHECK-DAG:          "[[STD_COMPAT]]" -> "[[PREFIX]]/main.cpp-x86_64-unknown-linux-gnu";
+// CHECK-DAG:          "[[CORE]]" -> "[[PREFIX]]/foo.cpp-x86_64-unknown-linux-gnu";
 // CHECK:      }
 
 

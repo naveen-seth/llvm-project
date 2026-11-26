@@ -1910,42 +1910,45 @@ Compilation *Driver::BuildCompilation(ArrayRef<const char *> ArgList) {
   modules::StdModuleManifest ModulesManifest;
   if (UseModulesDriver) {
     Diags.Report(diag::remark_performing_driver_managed_module_build);
+    // The modules driver uses the module cache path for all module builds.
+    C->getArgs().ClaimAllArgs(options::OPT_fmodules_cache_path);
+    C->getArgs().ClaimAllArgs(options::OPT_fmodules_driver_jobs_EQ);
 
-    modules::diagnoseModulesDriverArgs(C->getArgs(), Diags);
+    // Read the module manifests. The modules they describe are built on demand,
+    // if they are imported by any command-line input.
+    auto ReadManifest = [&](StringRef ManifestPath) {
+      auto ManifestOrErr =
+          modules::readStdModuleManifest(ManifestPath, getVFS());
+      if (ManifestOrErr) {
+        llvm::append_range(ModulesManifest.Modules,
+                           std::move(ManifestOrErr->Modules));
+        return;
+      }
+      llvm::handleAllErrors(
+          ManifestOrErr.takeError(),
+          [&](llvm::json::ParseError &Err) {
+            Diags.Report(diag::err_modules_manifest_failed_parse)
+                << Err.message();
+          },
+          [&](llvm::FileError &Err) {
+            Diags.Report(diag::err_cannot_open_file)
+                << Err.getFileName() << Err.messageWithoutFileInfo();
+          });
+    };
 
-    // Read the Standard library module manifest and, if available, add all
-    // discovered modules to this Compilation. Jobs for modules specified in
-    // the manifest that are not required by any command-line input are pruned
-    // later.
     const auto StdModuleManifestPath =
         GetStdModuleManifestPath(*C, C->getDefaultToolChain());
-
     if (!llvm::sys::fs::exists(StdModuleManifestPath))
       Diags.Report(diag::remark_modules_manifest_not_found);
     else {
       Diags.Report(diag::remark_using_modules_manifest)
           << StdModuleManifestPath;
-      if (auto ManifestOrErr =
-              modules::readStdModuleManifest(StdModuleManifestPath, getVFS())) {
-        ModulesManifest = std::move(*ManifestOrErr);
-        // Only allow on-demand imports of standard library modules for now.
-        llvm::erase_if(ModulesManifest.Modules, [](const auto &ModuleEntry) {
-          return !ModuleEntry.IsStdlib;
-        });
-        modules::buildStdModuleManifestInputs(ModulesManifest.Modules, *C,
-                                              Inputs);
-      } else {
-        llvm::handleAllErrors(
-            ManifestOrErr.takeError(),
-            [&](llvm::json::ParseError &Err) {
-              Diags.Report(diag::err_modules_manifest_failed_parse)
-                  << Err.message();
-            },
-            [&](llvm::FileError &Err) {
-              Diags.Report(diag::err_cannot_open_file)
-                  << Err.getFileName() << Err.messageWithoutFileInfo();
-            });
-      }
+      ReadManifest(StdModuleManifestPath);
+    }
+
+    for (Arg *A : C->getArgs().filtered(options::OPT_fmodules_manifest_EQ)) {
+      A->claim();
+      ReadManifest(A->getValue());
     }
   }
 
@@ -4480,20 +4483,19 @@ Action *Driver::ConstructPhaseAction(
     if (Args.hasArg(options::OPT_extract_api))
       return C.MakeAction<ExtractAPIJobAction>(Input, types::TY_API_INFO);
 
-    // Standard library modules always precompile in -fmodules-driver mode,
-    // even when -fsyntax-only is specified.
-    if (Input->getType() == types::TY_CXXStdModule ||
-        Input->getType() == types::TY_PP_CXXStdModule)
-      return C.MakeAction<PrecompileJobAction>(
-          Input, getPrecompiledType(Input->getType()));
-
     // With 'fmodules-reduced-bmi', we don't want to run the
     // precompile phase unless the user specified '--precompile' or
     // '--precompile-reduced-bmi'. If '--precompile' is specified, we will try
     // to emit the reduced BMI as a by product in
     // GenerateModuleInterfaceAction. If '--precompile-reduced-bmi' is
     // specified, we will generate the reduced BMI directly.
+    //
+    // With -fmodules-driver, module units are always compiled in two phases:
+    // the object file is compiled from the full BMI, and the Reduced BMI is
+    // emitted as a by-product of the precompilation.
     if (!Args.hasArg(options::OPT_fno_modules_reduced_bmi) &&
+        !Args.hasFlag(options::OPT_fmodules_driver,
+                      options::OPT_fno_modules_driver, false) &&
         (Input->getType() == driver::types::TY_CXXModule ||
          Input->getType() == driver::types::TY_PP_CXXModule) &&
         !Args.getLastArg(options::OPT__precompile) &&
@@ -4695,14 +4697,6 @@ void Driver::BuildJobs(Compilation &C) const {
       // The actions below do not increase the number of outputs.
       if (A->getKind() == clang::driver::Action::BinaryAnalyzeJobClass ||
           A->getKind() == clang::driver::Action::BinaryTranslatorJobClass)
-        continue;
-
-      // With -fmodules-driver, Standard library modules should not count toward
-      // the number of outputs, since they are implicitly added to the input
-      // list.
-      if (isa<PrecompileJobAction>(A) && !A->getInputs().empty() &&
-          (A->getInputs().front()->getType() == types::TY_CXXStdModule ||
-           A->getInputs().front()->getType() == types::TY_PP_CXXStdModule))
         continue;
 
       if (A->getType() != types::TY_Nothing &&
@@ -5672,15 +5666,6 @@ const char *Driver::GetNamedOutputPath(Compilation &C, const JobAction &JA,
     return CreateTempFile(C, Prefix, Suffix, MultipleArchs, BoundArchStr,
                           NeedUniqueDirectory);
   };
-
-  // Standard library output in -fmodules-driver?
-  if (isa<PrecompileJobAction>(JA) && !JA.getInputs().empty() &&
-      (JA.getInputs().front()->getType() == types::TY_CXXStdModule ||
-       JA.getInputs().front()->getType() == types::TY_PP_CXXStdModule)) {
-    StringRef Filename = llvm::sys::path::filename(BaseInput);
-    StringRef Stem = llvm::sys::path::stem(Filename);
-    return CreateTempOutputPath(Stem);
-  }
 
   // Output to a user requested destination?
   if (AtTopLevel && !isa<DsymutilJobAction>(JA) && !isa<VerifyJobAction>(JA)) {

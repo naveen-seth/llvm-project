@@ -180,6 +180,12 @@ private:
       const ModuleDeps &Deps,
       llvm::function_ref<void(CowCompilerInvocation &)> Optimize) const;
 
+  /// Get a Clang invocation adjusted to build the given C++20 named module
+  /// from its module unit source, based on the common invocation \p CI.
+  CowCompilerInvocation getInvocationAdjustedForNamedModuleBuildWithoutOutputs(
+      const ModuleDeps &Deps, CowCompilerInvocation &CI,
+      llvm::function_ref<void(CowCompilerInvocation &)> Optimize) const;
+
   /// Collect the module maps for the module dependencies that are named with
   /// -fmodule-file.
   ///

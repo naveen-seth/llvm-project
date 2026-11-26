@@ -650,8 +650,6 @@ def err_drv_reduced_module_output_overrided : Warning<
   "please consider use '-fmodule-output=' to specify the output file for reduced BMI explicitly">,
   InGroup<DiagGroup<"reduced-bmi-output-overrided">>;
 
-def err_drv_modules_driver_requires_reduced_bmi : Error<
-  "'-fmodules-driver' is currently incompatible with '-fno-modules-reduced-bmi'">;
 def remark_performing_driver_managed_module_build : Remark<
   "performing driver managed module build">, InGroup<ModulesDriver>;
 def remark_modules_manifest_not_found : Remark<
@@ -671,6 +669,15 @@ def err_dependency_scan_failed : Error<
   "failed to perform dependency scan">;
 def err_modules_driver_named_module_redefinition : Error<
   "duplicate definitions of C++20 named module '%0' in '%1' and '%2'">;
+def err_modules_driver_manifest_source_not_found : Error<
+  "module '%0' imported by '%1' is listed in a module manifest, but its "
+  "source file '%2' does not exist">;
+def err_modules_driver_named_module_not_found : Error<
+  "module '%0' imported by '%1' was not found; it is not provided by any "
+  "input or module manifest">;
+def err_drv_modules_driver_invalid_jobs : Error<
+  "invalid value '%0' in '-fmodules-driver-jobs='; expected a positive "
+  "integer">;
 def remark_printing_module_graph : Remark<
   "printing module dependency graph">,
   InGroup<ModulesDriver>;

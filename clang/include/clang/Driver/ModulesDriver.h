@@ -29,10 +29,6 @@ class Compilation;
 
 namespace clang::driver::modules {
 
-/// Emits diagnostics for arguments incompatible with -fmodules-driver.
-void diagnoseModulesDriverArgs(llvm::opt::DerivedArgList &DAL,
-                               DiagnosticsEngine &Diags);
-
 /// The parsed Standard library module manifest.
 struct StdModuleManifest {
   struct Module {
@@ -59,21 +55,12 @@ struct StdModuleManifest {
 llvm::Expected<StdModuleManifest>
 readStdModuleManifest(llvm::StringRef ManifestPath, llvm::vfs::FileSystem &VFS);
 
-/// Constructs compilation inputs for each module listed in the provided
-/// Standard library module manifest.
-///
-/// \param ManifestEntries All entries of the Standard library module manifest.
-/// \param C The Compilation being built.
-/// \param Inputs The input list to which the new module inputs are appended.
-void buildStdModuleManifestInputs(
-    ArrayRef<StdModuleManifest::Module> ManifestEntries, Compilation &C,
-    InputList &Inputs);
-
 /// Scans the compilation inputs for module dependencies and adjusts the
 /// compilation to build and supply those modules as required.
 ///
 /// \param C The Compilation being built.
-/// \param ManifestEntries All entries of the Standard library module manifest.
+/// \param ManifestEntries The entries of all module manifests. The modules they
+/// describe are built on demand if imported by any input.
 void runModulesDriver(Compilation &C,
                       ArrayRef<StdModuleManifest::Module> ManifestEntries);
 

@@ -3558,6 +3558,13 @@ ASTReader::ReadControlBlock(ModuleFile &F,
         ImportedFile = PP.getHeaderSearchInfo().getPrebuiltModuleFileName(
             ImportedName, /*FileMapOnly*/ !IsImportingStdCXXModule);
 
+      // C++20 named modules built implicitly during dependency scanning are
+      // stored in the module cache, uniqued by their interface source.
+      if (IsCXX20ModuleOrPrebuiltHeaderUnit && ImportedFile.empty() &&
+          ImportedKind == MK_ImplicitModule)
+        ImportedFile =
+            PP.getHeaderSearchInfo().getCachedNamedModuleFileName(ImportedName);
+
       if (IsCXX20ModuleOrPrebuiltHeaderUnit && ImportedFile.empty()) {
         Diag(diag::err_failed_to_find_module_file) << ImportedName;
         return Missing;

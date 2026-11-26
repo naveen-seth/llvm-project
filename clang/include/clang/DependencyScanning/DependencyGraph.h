@@ -93,6 +93,14 @@ struct ModuleDeps {
   /// Whether current working directory is ignored.
   bool IgnoreCWD;
 
+  /// Whether this is a C++20 named module (or partition) rather than a Clang
+  /// module.
+  bool IsCXXNamedModule = false;
+
+  /// For C++20 named modules, the path to the module unit source that is used
+  /// to explicitly build this module.
+  std::string CXXNamedModuleSource;
+
   /// The path to the modulemap file which defines this module.
   ///
   /// This can be used to explicitly build this module. This file will

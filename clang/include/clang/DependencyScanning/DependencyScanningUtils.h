@@ -20,6 +20,15 @@
 
 namespace clang {
 namespace dependencies {
+/// Sets up by-name scanning (\c DependencyScanningWorker::
+/// computeDependenciesByName) for \p CommandLine, which must not have an
+/// input.
+///
+/// \returns an overlay file system with a fake input and \p CommandLine with
+/// that input appended.
+std::pair<IntrusiveRefCntPtr<llvm::vfs::FileSystem>, std::vector<std::string>>
+initVFSForByNameScanning(ArrayRef<std::string> CommandLine);
+
 class FullDependencyConsumer : public DependencyConsumer {
 public:
   FullDependencyConsumer(const llvm::DenseSet<ModuleID> &AlreadySeen)

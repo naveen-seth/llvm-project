@@ -40,6 +40,7 @@
 #include "clang/Sema/ParsedAttr.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Serialization/ASTReader.h"
+#include "clang/Serialization/ASTWriter.h"
 #include "clang/Serialization/GlobalModuleIndex.h"
 #include "clang/Serialization/InMemoryModuleCache.h"
 #include "clang/Serialization/ModuleCache.h"
@@ -466,6 +467,27 @@ static void InitializeFileRemapping(DiagnosticsEngine &Diags,
 
 // Preprocessor
 
+/// Returns true if \p CI may build C++20 named modules implicitly. This is only
+/// done during dependency scanning (preprocessor-only module builds) for
+/// modules whose interface sources were provided.
+static bool canBuildNamedModulesImplicitly(const CompilerInstance &CI) {
+  const HeaderSearchOptions &HSOpts = CI.getHeaderSearchOpts();
+  return CI.getLangOpts().CPlusPlusModules &&
+         HSOpts.ModulesSerializeOnlyPreprocessor &&
+         !HSOpts.NamedModuleSources.empty();
+}
+
+/// Returns the provided interface source of the named module \p ModuleName,
+/// if the module can be built implicitly by \p CI.
+static const HeaderSearchOptions::NamedModuleSource *
+getImplicitNamedModuleSource(const CompilerInstance &CI, StringRef ModuleName) {
+  if (!canBuildNamedModulesImplicitly(CI))
+    return nullptr;
+  const auto &Sources = CI.getHeaderSearchOpts().NamedModuleSources;
+  auto It = Sources.find(ModuleName);
+  return It == Sources.end() ? nullptr : &It->second;
+}
+
 void CompilerInstance::createPreprocessor(TranslationUnitKind TUKind) {
   const PreprocessorOptions &PPOpts = getPreprocessorOpts();
 
@@ -508,7 +530,8 @@ void CompilerInstance::createPreprocessor(TranslationUnitKind TUKind) {
 
   PP->setPreprocessedOutput(getPreprocessorOutputOpts().ShowCPP);
 
-  if (PP->getLangOpts().Modules && PP->getLangOpts().ImplicitModules) {
+  if ((PP->getLangOpts().Modules && PP->getLangOpts().ImplicitModules) ||
+      canBuildNamedModulesImplicitly(*this)) {
     // FIXME: We already might've computed the context hash and the specific
     // module cache path in `FrontendAction::BeginSourceFile()` when turning
     // "-include-pch <DIR>" into "-include-pch <DIR>/<FILE>". Reuse those here.
@@ -1302,6 +1325,46 @@ std::unique_ptr<CompilerInstance> CompilerInstance::cloneForModuleCompileImpl(
 }
 
 namespace {
+/// Generates the module file of an implicitly built C++20 named module into a
+/// stream, instead of writing it directly to the output file.
+class ImplicitNamedModuleGenerator : public CXX20ModulesGenerator {
+  std::unique_ptr<raw_pwrite_stream> OS;
+
+public:
+  ImplicitNamedModuleGenerator(Preprocessor &PP, ModuleCache &ModCache,
+                               StringRef OutputFile,
+                               const CodeGenOptions &CodeGenOpts,
+                               std::unique_ptr<raw_pwrite_stream> OS)
+      : CXX20ModulesGenerator(PP, ModCache, OutputFile, CodeGenOpts),
+        OS(std::move(OS)) {}
+
+  void HandleTranslationUnit(ASTContext &Ctx) override {
+    PCHGenerator::HandleTranslationUnit(Ctx);
+    if (!isComplete())
+      return;
+    *OS << getBufferPtr()->Data;
+    OS->flush();
+  }
+};
+
+/// Builds an implicit C++20 named module from its interface unit source.
+class GenerateImplicitNamedModuleAction : public GenerateModuleInterfaceAction {
+  std::unique_ptr<raw_pwrite_stream> OS;
+
+public:
+  explicit GenerateImplicitNamedModuleAction(
+      std::unique_ptr<raw_pwrite_stream> OS)
+      : OS(std::move(OS)) {}
+
+protected:
+  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
+                                                 StringRef InFile) override {
+    return std::make_unique<ImplicitNamedModuleGenerator>(
+        CI.getPreprocessor(), CI.getModuleCache(),
+        CI.getFrontendOpts().OutputFile, CI.getCodeGenOpts(), std::move(OS));
+  }
+};
+
 class PrettyStackTraceBuildModule : public llvm::PrettyStackTraceEntry {
   StringRef ModuleName;
   StringRef ModuleFileName;
@@ -1347,8 +1410,14 @@ CompilerInstance::compileModule(SourceLocation ImportLoc, StringRef ModuleName,
 
         auto OS = std::make_unique<llvm::raw_svector_ostream>(Buffer);
 
-        std::unique_ptr<FrontendAction> Action =
-            std::make_unique<GenerateModuleFromModuleMapAction>(std::move(OS));
+        std::unique_ptr<FrontendAction> Action;
+        if (Instance.getFrontendOpts().Inputs.front().getKind().getFormat() ==
+            InputKind::Source)
+          Action = std::make_unique<GenerateImplicitNamedModuleAction>(
+              std::move(OS));
+        else
+          Action = std::make_unique<GenerateModuleFromModuleMapAction>(
+              std::move(OS));
 
         if (auto WrapGenModuleAction = Instance.getGenModuleActionWrapper())
           Action = WrapGenModuleAction(Instance.getFrontendOpts(),
@@ -1417,6 +1486,24 @@ std::unique_ptr<CompilerInstance> CompilerInstance::cloneForModuleCompile(
     SourceLocation ImportLoc, const Module *Module, StringRef ModuleFileName,
     std::optional<ThreadSafeCloneConfig> ThreadSafeConfig) {
   StringRef ModuleName = Module->getTopLevelModuleName();
+
+  // C++20 named modules are built from their interface unit source.
+  if (const auto *NamedSource =
+          Module->isNamedModule()
+              ? getImplicitNamedModuleSource(*this, Module->Name)
+              : nullptr) {
+    auto Instance = cloneForModuleCompileImpl(
+        ImportLoc, Module->Name,
+        FrontendInputFile(NamedSource->SourcePath, InputKind(Language::CXX),
+                          /*IsSystem=*/NamedSource->IsStdLibrary),
+        /*OriginalModuleMapFile=*/"", ModuleFileName,
+        Module->getDirectoryDependencies(), std::move(ThreadSafeConfig));
+    if (NamedSource->IsStdLibrary)
+      Instance->getDiagnostics().setSeverityForGroup(
+          diag::Flavor::WarningOrError, "reserved-module-identifier",
+          diag::Severity::Ignored);
+    return Instance;
+  }
 
   InputKind IK(getLanguageFromOptions(getLangOpts()), InputKind::ModuleMap);
 
@@ -1948,7 +2035,12 @@ static ModuleSource selectModuleSource(
 
   // Try to load the module from the module cache.
   if (M) {
-    ModuleFilename = HS.getCachedModuleFileName(M);
+    // Implicitly built C++20 named modules have no module map. Their module
+    // file is uniqued by the path of their interface unit instead.
+    if (M->isNamedModule())
+      ModuleFilename = HS.getCachedNamedModuleFileName(ModuleName);
+    if (ModuleFilename.empty())
+      ModuleFilename = HS.getCachedModuleFileName(M);
     return MS_ModuleCache;
   }
 
@@ -1962,6 +2054,18 @@ ModuleLoadResult CompilerInstance::findOrCompileModuleAndReadAST(
   HeaderSearch &HS = PP->getHeaderSearchInfo();
   Module *M =
       HS.lookupModule(ModuleName, ImportLoc, true, !IsInclusionDirective);
+
+  // During dependency scanning, C++20 named modules with a provided interface
+  // source are built implicitly. Create a placeholder module for them, which
+  // is completed once the built module file is read.
+  if (!M && getImplicitNamedModuleSource(*this, ModuleName)) {
+    M = HS.getModuleMap().findOrCreateModuleFirst(
+        ModuleName, /*Parent=*/nullptr, /*IsFramework=*/false,
+        /*IsExplicit=*/false);
+    if (M->Kind == Module::ModuleMapModule)
+      M->Kind = ModuleName.contains(':') ? Module::ModulePartitionInterface
+                                         : Module::ModuleInterfaceUnit;
+  }
 
   // Check for any configuration macros that have changed. This is done
   // immediately before potentially building a module in case this module

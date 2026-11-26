@@ -64,14 +64,12 @@ int main() {}
 // CHECK: clang: remark: printing module dependency graph [-Rmodules-driver]
 
 // Checks that the standard library modules are primary outputs.
-// TODO: Test the same for -fno-modules-reduced-bmi when supported by 
-// -fmodules-driver.
 // CHECK: -o {{.*std-[^ ]*\.pcm}}
 // CHECK-SAME: -emit-reduced-module-interface
-// CHECK-SAME: -main-file-name std.cppm
+// CHECK-SAME: -x c++ {{.*}}std.cppm
 // CHECK: -o {{.*std\.compat-[^ ]*\.pcm}}
 // CHECK-SAME: -emit-reduced-module-interface
-// CHECK-SAME: -main-file-name std.compat.cppm
+// CHECK-SAME: -x c++ {{.*}}std.compat.cppm
 
 // Checks that the object file is generated for the main TU.
 // CHECK: -emit-obj
@@ -99,10 +97,10 @@ int main() {}
 
 // CHECK-EMIT-LLVM: -o {{.*std-[^ ]*\.pcm}}
 // CHECK-EMIT-LLVM-SAME: -emit-reduced-module-interface
-// CHECK-EMIT-LLVM-SAME: -main-file-name std.cppm
+// CHECK-EMIT-LLVM-SAME: -x c++ {{.*}}std.cppm
 // CHECK-EMIT-LLVM: -o {{.*std\.compat-[^ ]*\.pcm}}
 // CHECK-EMIT-LLVM-SAME: -emit-reduced-module-interface
-// CHECK-EMIT-LLVM-SAME: -main-file-name std.compat.cppm
+// CHECK-EMIT-LLVM-SAME: -x c++ {{.*}}std.compat.cppm
 // CHECK-EMIT-LLVM: -emit-llvm
 // CHECK-EMIT-LLVM-SAME: -main-file-name main.cpp
 
@@ -124,10 +122,10 @@ int main() {}
 
 // CHECK-SYNTAX-ONLY: -o {{.*std-[^ ]*\.pcm}}
 // CHECK-SYNTAX-ONLY-SAME: -emit-reduced-module-interface
-// CHECK-SYNTAX-ONLY-SAME: -main-file-name std.cppm
+// CHECK-SYNTAX-ONLY-SAME: -x c++ {{.*}}std.cppm
 // CHECK-SYNTAX-ONLY: -o {{.*std\.compat-[^ ]*\.pcm}}
 // CHECK-SYNTAX-ONLY-SAME: -emit-reduced-module-interface
-// CHECK-SYNTAX-ONLY-SAME: -main-file-name std.compat.cppm
+// CHECK-SYNTAX-ONLY-SAME: -x c++ {{.*}}std.compat.cppm
 
 // CHECK-SYNTAX-ONLY: -cc1 {{.*}} -Rmodules-driver
 // CHECK-SYNTAX-ONLY-NOT: {{ -o }}

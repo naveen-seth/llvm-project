@@ -260,6 +260,15 @@ ModuleFileName HeaderSearch::getCachedModuleFileName(StringRef ModuleName,
                                      getNormalizedModuleCachePath());
 }
 
+ModuleFileName
+HeaderSearch::getCachedNamedModuleFileName(StringRef ModuleName) {
+  const auto &Sources = HSOpts.NamedModuleSources;
+  const auto It = Sources.find(ModuleName);
+  if (It == Sources.end())
+    return {};
+  return getCachedModuleFileName(ModuleName, It->second.SourcePath);
+}
+
 ModuleFileName HeaderSearch::getCachedModuleFileNameImpl(
     StringRef ModuleName, StringRef ModuleMapPath, StringRef CachePath) {
   // If we don't have a module cache path or aren't supposed to use one, we

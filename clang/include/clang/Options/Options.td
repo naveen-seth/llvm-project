@@ -3897,6 +3897,23 @@ def fdepscan_log_path : Joined<["-"], "fdepscan-log-path=">,
   MetaVarName<"<file>">,
   HelpText<"Log the timing of dependency scanning actions to <file>. Only "
            "takes effect while running the dependency scanner.">;
+def fmodules_manifest_EQ : Joined<["-"], "fmodules-manifest=">,
+  Group<f_Group>,
+  Visibility<[ClangOption]>,
+  MetaVarName<"<file>">,
+  HelpText<"Use the C++ module manifest <file> to locate named modules in "
+           "driver managed module builds (experimental)">;
+def fmodules_driver_jobs_EQ : Joined<["-"], "fmodules-driver-jobs=">,
+  Group<f_Group>,
+  Visibility<[ClangOption]>,
+  MetaVarName<"<n>">,
+  HelpText<"Run up to <n> jobs in parallel in driver managed module builds "
+           "(experimental)">;
+def fmodule_source_EQ : Joined<["-"], "fmodule-source=">,
+  Visibility<[CC1Option]>,
+  MetaVarName<"<name>=<file>">,
+  HelpText<"Use <file> as the interface unit of the C++20 named module <name> "
+           "when building it implicitly during dependency scanning">;
 
 def fincremental_extensions :
   Flag<["-"], "fincremental-extensions">,

@@ -119,6 +119,29 @@ public:
   /// The directories used to load prebuilt module files.
   std::vector<std::string> PrebuiltModulePaths;
 
+  /// Describes where the interface unit of a C++20 named module is, so that
+  /// dependency scanning can build the module implicitly when it is imported.
+  struct NamedModuleSource {
+    /// The path of the module's primary interface unit, or of the partition
+    /// unit for partitions.
+    std::string SourcePath;
+
+    /// Additional system include directories used to build this module.
+    std::vector<std::string> SystemIncludeDirs;
+
+    /// Whether this is a Standard library module, such as 'std'.
+    bool IsStdLibrary = false;
+
+    /// Whether the explicit build of this module should emit a Reduced BMI.
+    bool ReducedBMI = true;
+  };
+
+  /// The mapping of C++20 named module names to their interface sources.
+  ///
+  /// This is only used during dependency scanning, where an import of a
+  /// listed module builds the module implicitly (preprocessor-only).
+  std::map<std::string, NamedModuleSource, std::less<>> NamedModuleSources;
+
   /// The module/pch container format.
   std::string ModuleFormat;
 

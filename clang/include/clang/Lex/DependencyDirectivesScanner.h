@@ -19,6 +19,8 @@
 
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/ArrayRef.h"
+#include <optional>
+#include <string>
 
 namespace clang {
 class FileManager;
@@ -156,6 +158,37 @@ enum class ModuleUnitKind {
 ///
 /// \returns the kind of C++20 module unit found in the input.
 ModuleUnitKind scanInputForCXX20ModuleUnit(StringRef Source);
+
+/// The module declaration of a C++20 module unit.
+struct CXX20ModuleDeclaration {
+  /// The full name of the declared module, including the partition, if any
+  /// (e.g. "M:part").
+  std::string Name;
+
+  /// Whether this is a module interface unit, i.e. 'export module'.
+  bool IsExported = false;
+
+  /// Whether this declares a module partition.
+  bool IsPartition = false;
+
+  /// Whether the module unit provides an importable module, i.e. it is not a
+  /// (non-partition) module implementation unit.
+  bool providesModule() const { return IsExported || IsPartition; }
+};
+
+/// Scan an input source buffer for its C++20 module declaration, without
+/// running the preprocessor.
+///
+/// This is exact for well-formed inputs: a module declaration must appear in
+/// the main file, after an optional global module fragment, outside of
+/// preprocessor conditionals, and its name cannot be formed by macros.
+///
+/// \param Source The input source buffer.
+///
+/// \returns the module declaration, or std::nullopt if the input is not a
+/// module unit.
+std::optional<CXX20ModuleDeclaration>
+scanInputForCXX20ModuleDeclaration(StringRef Source);
 
 /// Scan an input source buffer, and check whether the input source is a
 /// preprocessed output.

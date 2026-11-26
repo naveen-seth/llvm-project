@@ -3385,6 +3385,10 @@ static void GenerateHeaderSearchArgs(const HeaderSearchOptions &Opts,
   for (const auto &File : Opts.PrebuiltModuleFiles)
     GenerateArg(Consumer, OPT_fmodule_file, File.first + "=" + File.second);
 
+  for (const auto &[Name, Source] : Opts.NamedModuleSources)
+    GenerateArg(Consumer, OPT_fmodule_source_EQ,
+                Name + "=" + Source.SourcePath);
+
   for (const auto &Path : Opts.PrebuiltModulePaths)
     GenerateArg(Consumer, OPT_fprebuilt_module_path, Path);
 
@@ -3508,6 +3512,11 @@ static bool ParseHeaderSearchArgs(HeaderSearchOptions &Opts, ArgList &Args,
       Opts.PrebuiltModuleFiles.insert_or_assign(
           std::string(Split.first), std::string(Split.second));
     }
+  }
+  for (const auto *A : Args.filtered(OPT_fmodule_source_EQ)) {
+    auto [Name, Path] = StringRef(A->getValue()).split('=');
+    if (!Name.empty() && !Path.empty())
+      Opts.NamedModuleSources[Name.str()].SourcePath = Path.str();
   }
   for (const auto *A : Args.filtered(OPT_fprebuilt_module_path))
     Opts.AddPrebuiltModulePath(A->getValue());

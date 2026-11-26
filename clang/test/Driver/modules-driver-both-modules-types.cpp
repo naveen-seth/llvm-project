@@ -47,30 +47,25 @@
 // CHECK-CC1-SAME: "-fmodule-name=root"
 // CHECK-CC1-SAME: "-fno-implicit-modules"
 
-// CHECK-CC1: "-cc1"
-// CHECK-CC1-SAME: "[[PREFIX]]/A-part1-impl.cppm"
+// Module units are compiled in two phases. The precompile job emits the full
+// BMI, and the Reduced BMI for importers as a by-product.
+// CHECK-CC1: "-cc1" {{.*}} "-fmodule-output={{[^"]+}}" {{.*}} "-emit-module-interface" {{.*}} "[[PREFIX]]/A-part1-impl.cppm"
 // CHECK-CC1-SAME: "-fmodule-file=root=[[ROOTPCM]]"
 // CHECK-CC1-SAME: "-fno-implicit-modules"
-// CHECK-CC1-SAME: "-fmodule-output=[[A_PART1_IMPL_PCM:[^"]+]]"
 
-// CHECK-CC1: "-cc1"
-// CHECK-CC1-SAME: "[[PREFIX]]/A-part1.cppm"
+// CHECK-CC1: "-cc1" {{.*}} "-fmodule-output=[[A_PART1_PCM:[^"]+]]" {{.*}} "-emit-module-interface" {{.*}} "[[PREFIX]]/A-part1.cppm"
 // CHECK-CC1-SAME: "-fmodule-file=root=[[ROOTPCM]]"
 // CHECK-CC1-SAME: "-fno-implicit-modules"
-// CHECK-CC1-SAME: "-fmodule-output=[[A_PART1_PCM:[^"]+]]"
 
-// CHECK-CC1: "-cc1"
-// CHECK-CC1-SAME: "[[PREFIX]]/A.cppm"
-// CHECK-CC1-SAME: "-fmodule-file=root=[[ROOTPCM]]"
-// CHECK-CC1-SAME: "-fno-implicit-modules"
-// CHECK-CC1-SAME: "-fmodule-output=[[A_PCM:[^"]+]]"
+// CHECK-CC1: "-cc1" {{.*}} "-fmodule-output=[[A_PCM:[^"]+]]" {{.*}} "-emit-module-interface" {{.*}} "[[PREFIX]]/A.cppm"
 // CHECK-CC1-SAME: "-fmodule-file=A:part1=[[A_PART1_PCM]]"
-
-// CHECK-CC1: "-cc1"
-// CHECK-CC1-SAME: "[[PREFIX]]/main.cpp"
+// CHECK-CC1-SAME: "-fmodule-file=root=[[ROOTPCM]]"
 // CHECK-CC1-SAME: "-fno-implicit-modules"
+
+// CHECK-CC1: "-cc1" {{.*}} "-emit-obj" {{.*}} "[[PREFIX]]/main.cpp"
 // CHECK-CC1-SAME: "-fmodule-file=A=[[A_PCM]]"
 // CHECK-CC1-SAME: "-fmodule-file=A:part1=[[A_PART1_PCM]]"
+// CHECK-CC1-SAME: "-fno-implicit-modules"
 
 //--- main.cpp
 import A;
